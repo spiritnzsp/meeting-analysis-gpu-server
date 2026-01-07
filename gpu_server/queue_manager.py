@@ -171,8 +171,7 @@ class QueueManager:
                     return queued
 
                 # Remove from lookup
-                if queued.request.request_id in self._requests:
-                    del self._requests[queued.request.request_id]
+                self._requests.pop(queued.request.request_id, None)
 
                 # Clear not_empty if queue is now empty
                 if not self._queue:

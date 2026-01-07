@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+from .validation import ALLOWED_WHISPER_MODELS
+
 logger = logging.getLogger(__name__)
 
 
@@ -457,14 +459,10 @@ def validate_config(config: Config, strict: bool = True):
         warnings.append(f"max_message_size very large ({config.server.max_message_size / 1024 / 1024:.0f}MB), may cause memory issues")
 
     # Whisper config validation
-    valid_whisper_models = {
-        "tiny", "tiny.en", "base", "base.en", "small", "small.en",
-        "medium", "medium.en", "large", "large-v1", "large-v2", "large-v3",
-    }
-    if config.whisper.model not in valid_whisper_models:
+    if config.whisper.model not in ALLOWED_WHISPER_MODELS:
         errors.append(
             f"Invalid whisper.model: '{config.whisper.model}'. "
-            f"Must be one of: {', '.join(sorted(valid_whisper_models))}"
+            f"Must be one of: {', '.join(sorted(ALLOWED_WHISPER_MODELS))}"
         )
     valid_compute_types = {'float16', 'float32', 'int8', 'int8_float16', 'int8_float32'}
     if config.whisper.compute_type not in valid_compute_types:
