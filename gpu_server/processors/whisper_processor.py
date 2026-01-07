@@ -3,15 +3,20 @@ Whisper Transcription Processor
 
 GPU-accelerated speech-to-text using faster-whisper.
 """
+import asyncio
 import logging
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Optional, List, Callable, Awaitable
+from typing import Optional, List, Callable, Awaitable, Tuple
 
 from ..config import WhisperConfig
 from ..protocol import TranscriptSegment, ProgressMessage, ProcessingStage
 
 logger = logging.getLogger(__name__)
+
+# Dedicated thread pool for GPU operations to avoid blocking event loop
+_gpu_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="whisper_gpu")
 
 
 class WhisperProcessor:
@@ -23,6 +28,7 @@ class WhisperProcessor:
     - Word-level timestamps
     - Language detection
     - Multiple model sizes
+    - Non-blocking async interface (GPU ops run in executor)
     """
 
     def __init__(self, config: WhisperConfig):
@@ -36,8 +42,8 @@ class WhisperProcessor:
         self._model = None
         self._model_name = None
 
-    def _ensure_model(self, model_name: Optional[str] = None):
-        """Load the model if not already loaded."""
+    def _ensure_model_sync(self, model_name: Optional[str] = None):
+        """Load the model if not already loaded (synchronous, runs in executor)."""
         target_model = model_name or self.config.model
 
         if self._model is not None and self._model_name == target_model:
@@ -59,6 +65,48 @@ class WhisperProcessor:
             logger.error(f"Failed to load Whisper model: {e}")
             raise
 
+    def _transcribe_sync(
+        self,
+        audio_path: Path,
+        language: Optional[str],
+    ) -> Tuple[List[dict], str, float]:
+        """
+        Synchronous transcription (runs in executor).
+
+        Returns:
+            Tuple of (raw_segments, detected_language, language_probability)
+        """
+        segments_iter, info = self._model.transcribe(
+            str(audio_path),
+            language=language or self.config.language,
+            beam_size=self.config.beam_size,
+            word_timestamps=True,
+            vad_filter=True,
+        )
+
+        # Convert iterator to list (this consumes the generator)
+        raw_segments = []
+        for segment in segments_iter:
+            words = []
+            if segment.words:
+                for word in segment.words:
+                    words.append({
+                        "word": word.word,
+                        "start": word.start,
+                        "end": word.end,
+                        "probability": word.probability,
+                    })
+
+            raw_segments.append({
+                "start": segment.start,
+                "end": segment.end,
+                "text": segment.text.strip(),
+                "avg_logprob": getattr(segment, 'avg_logprob', 0.0),
+                "words": words,
+            })
+
+        return raw_segments, info.language, info.language_probability
+
     async def transcribe(
         self,
         audio_data: bytes,
@@ -66,9 +114,9 @@ class WhisperProcessor:
         model_override: Optional[str] = None,
         progress_callback: Optional[Callable[[ProgressMessage], Awaitable[None]]] = None,
         request_id: str = "",
-    ) -> tuple[List[TranscriptSegment], str, str]:
+    ) -> Tuple[List[TranscriptSegment], str, str]:
         """
-        Transcribe audio data.
+        Transcribe audio data (non-blocking).
 
         Args:
             audio_data: Raw audio bytes (opus, wav, etc.)
@@ -80,8 +128,14 @@ class WhisperProcessor:
         Returns:
             Tuple of (segments, full_text, detected_language)
         """
-        # Load model
-        self._ensure_model(model_override)
+        loop = asyncio.get_running_loop()
+
+        # Load model in executor (blocking operation)
+        await loop.run_in_executor(
+            _gpu_executor,
+            self._ensure_model_sync,
+            model_override
+        )
 
         # Write audio to temp file (faster-whisper needs file path)
         with tempfile.NamedTemporaryFile(suffix=".opus", delete=False) as f:
@@ -97,54 +151,38 @@ class WhisperProcessor:
                     message="Starting transcription..."
                 ))
 
-            # Run transcription
-            segments_iter, info = self._model.transcribe(
-                str(audio_path),
-                language=language or self.config.language,
-                beam_size=self.config.beam_size,
-                word_timestamps=True,
-                vad_filter=True,
+            # Run transcription in executor (blocking GPU operation)
+            raw_segments, detected_language, lang_prob = await loop.run_in_executor(
+                _gpu_executor,
+                self._transcribe_sync,
+                audio_path,
+                language,
             )
 
-            detected_language = info.language
-            logger.info(f"Detected language: {detected_language} (prob: {info.language_probability:.2f})")
+            logger.info(f"Detected language: {detected_language} (prob: {lang_prob:.2f})")
 
-            # Convert segments
+            # Convert to TranscriptSegment objects (non-blocking)
             segments: List[TranscriptSegment] = []
             full_text_parts = []
 
-            segment_list = list(segments_iter)
-            total_segments = len(segment_list)
-
-            for i, segment in enumerate(segment_list):
-                # Extract word-level timestamps
-                words = []
-                if segment.words:
-                    for word in segment.words:
-                        words.append({
-                            "word": word.word,
-                            "start": word.start,
-                            "end": word.end,
-                            "probability": word.probability,
-                        })
-
+            for i, raw_seg in enumerate(raw_segments):
                 segments.append(TranscriptSegment(
-                    start=segment.start,
-                    end=segment.end,
-                    text=segment.text.strip(),
-                    confidence=segment.avg_logprob if hasattr(segment, 'avg_logprob') else 1.0,
-                    words=words,
+                    start=raw_seg["start"],
+                    end=raw_seg["end"],
+                    text=raw_seg["text"],
+                    confidence=raw_seg["avg_logprob"],
+                    words=raw_seg["words"],
                 ))
-                full_text_parts.append(segment.text.strip())
+                full_text_parts.append(raw_seg["text"])
 
                 # Progress update every 10 segments
                 if progress_callback and i % 10 == 0:
-                    percent = 10 + int((i / max(total_segments, 1)) * 40)  # 10-50%
+                    percent = 10 + int((i / max(len(raw_segments), 1)) * 40)  # 10-50%
                     await progress_callback(ProgressMessage(
                         request_id=request_id,
                         stage=ProcessingStage.TRANSCRIBING,
                         percent=percent,
-                        message=f"Transcribed {i+1}/{total_segments} segments"
+                        message=f"Processing {i+1}/{len(raw_segments)} segments"
                     ))
 
             full_text = " ".join(full_text_parts)

@@ -6,17 +6,40 @@ Main server that handles client connections and routes requests.
 import asyncio
 import json
 import logging
-from typing import Dict, Set, Optional
+import time
+from collections import defaultdict
+from dataclasses import dataclass, field
+from typing import Dict, Set, Optional, List
 
 import websockets
 from websockets.server import WebSocketServerProtocol
 
-from .config import Config
+from .config import Config, create_ssl_context, verify_api_key
+
+
+@dataclass
+class RateLimitTracker:
+    """Tracks rate limit state for a client."""
+    request_times: List[float] = field(default_factory=list)
+
+    def record_request(self):
+        """Record a request timestamp."""
+        self.request_times.append(time.time())
+
+    def get_request_count(self, window_seconds: float) -> int:
+        """Get number of requests in the time window."""
+        cutoff = time.time() - window_seconds
+        # Prune old entries
+        self.request_times = [t for t in self.request_times if t > cutoff]
+        return len(self.request_times)
+
+
 from .queue_manager import QueueManager
 from .worker import GPUWorker
 from .protocol import (
     MessageType, parse_message, ProcessRequest, AuthMessage,
-    ProgressMessage, ProcessingStage, ErrorMessage
+    ProgressMessage, ProcessingStage, ErrorMessage,
+    PROTOCOL_VERSION_STRING, is_version_compatible
 )
 
 logger = logging.getLogger(__name__)
@@ -49,12 +72,16 @@ class GPUServer:
 
         self._authenticated_clients: Set[WebSocketServerProtocol] = set()
         self._client_info: Dict[WebSocketServerProtocol, dict] = {}
+        self._rate_limiters: Dict[WebSocketServerProtocol, RateLimitTracker] = {}
         self._server = None
         self._worker_task = None
 
     async def start(self):
         """Start the server."""
         logger.info(f"Starting GPU Server on {self.config.server.host}:{self.config.server.port}")
+
+        # Create SSL context if TLS is enabled
+        ssl_context = create_ssl_context(self.config.tls)
 
         # Start the worker
         self._worker_task = asyncio.create_task(self.worker.start())
@@ -64,12 +91,17 @@ class GPUServer:
             self._handle_connection,
             self.config.server.host,
             self.config.server.port,
-            max_size=100 * 1024 * 1024,  # 100MB max message size for audio
+            max_size=self.config.server.max_message_size,
             ping_interval=30,
             ping_timeout=10,
+            ssl=ssl_context,
         )
 
-        logger.info(f"GPU Server listening on ws://{self.config.server.host}:{self.config.server.port}")
+        max_mb = self.config.server.max_message_size / (1024 * 1024)
+        logger.info(f"Max message size: {max_mb:.0f} MB")
+
+        protocol = "wss" if ssl_context else "ws"
+        logger.info(f"GPU Server listening on {protocol}://{self.config.server.host}:{self.config.server.port}")
 
     async def stop(self):
         """Stop the server."""
@@ -106,6 +138,17 @@ class GPUServer:
         client_addr = websocket.remote_address
         logger.info(f"New connection from {client_addr}")
 
+        # Enforce connection limit
+        max_conn = self.config.server.max_connections
+        if len(self._authenticated_clients) >= max_conn:
+            logger.warning(f"Connection limit reached ({max_conn}), rejecting {client_addr}")
+            await websocket.send(json.dumps({
+                "type": MessageType.AUTH_FAILED,
+                "error": "Server connection limit reached, try again later"
+            }))
+            await websocket.close(1013, "Server overloaded")  # 1013 = Try again later
+            return
+
         try:
             # Wait for authentication
             authenticated = await self._authenticate(websocket)
@@ -113,6 +156,7 @@ class GPUServer:
                 return
 
             self._authenticated_clients.add(websocket)
+            self._rate_limiters[websocket] = RateLimitTracker()
 
             # Handle messages
             async for message in websocket:
@@ -125,6 +169,7 @@ class GPUServer:
         finally:
             self._authenticated_clients.discard(websocket)
             self._client_info.pop(websocket, None)
+            self._rate_limiters.pop(websocket, None)
             logger.info(f"Client disconnected: {client_addr}")
 
     async def _authenticate(self, websocket: WebSocketServerProtocol) -> bool:
@@ -156,8 +201,19 @@ class GPUServer:
 
             auth_msg = AuthMessage.from_dict(data)
 
-            # Check API key
-            if auth_msg.api_key not in self.config.auth.api_keys:
+            # Check protocol version compatibility
+            compatible, version_error = is_version_compatible(auth_msg.protocol_version)
+            if not compatible:
+                logger.warning(f"Protocol version incompatible from {websocket.remote_address}: {version_error}")
+                await websocket.send(json.dumps({
+                    "type": MessageType.AUTH_FAILED,
+                    "error": version_error,
+                    "server_protocol_version": PROTOCOL_VERSION_STRING,
+                }))
+                return False
+
+            # Check API key using constant-time comparison
+            if not verify_api_key(auth_msg.api_key, self.config.auth.api_key_hashes):
                 logger.warning(f"Authentication failed: invalid API key from {websocket.remote_address}")
                 await websocket.send(json.dumps({
                     "type": MessageType.AUTH_FAILED,
@@ -168,12 +224,14 @@ class GPUServer:
             # Store client info
             self._client_info[websocket] = {
                 "client_version": auth_msg.client_version,
+                "protocol_version": auth_msg.protocol_version,
                 "authenticated_at": asyncio.get_event_loop().time(),
             }
 
             await websocket.send(json.dumps({
                 "type": MessageType.AUTH_OK,
                 "server_version": "0.1.0",
+                "protocol_version": PROTOCOL_VERSION_STRING,
                 "queue_size": self.queue.size,
             }))
 
@@ -226,6 +284,24 @@ class GPUServer:
         """Handle a processing request."""
         try:
             request = ProcessRequest.from_dict(data)
+
+            # Check rate limit
+            rate_limiter = self._rate_limiters.get(websocket)
+            if rate_limiter:
+                request_count = rate_limiter.get_request_count(self.config.server.rate_limit_window)
+                if request_count >= self.config.server.rate_limit_requests:
+                    logger.warning(
+                        f"Rate limit exceeded for {websocket.remote_address}: "
+                        f"{request_count} requests in {self.config.server.rate_limit_window}s"
+                    )
+                    await websocket.send(ErrorMessage(
+                        request_id=request.request_id,
+                        error=f"Rate limit exceeded. Max {self.config.server.rate_limit_requests} "
+                              f"requests per {self.config.server.rate_limit_window} seconds.",
+                        recoverable=True,
+                    ).to_json())
+                    return
+                rate_limiter.record_request()
 
             logger.info(
                 f"Received process request: {request.request_id} "

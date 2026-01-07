@@ -24,6 +24,7 @@ class QueuedRequest:
     websocket: object = field(compare=False)  # WebSocket connection
     queued_at: datetime = field(compare=False, default_factory=datetime.now)
     cancelled: bool = field(compare=False, default=False)
+    timeout_expired: bool = field(compare=False, default=False)  # True if request timed out in queue
 
 
 class QueueManager:
@@ -133,6 +134,23 @@ class QueueManager:
                 if queued.cancelled:
                     del self._requests[queued.request.request_id]
                     continue
+
+                # Check if request has expired while waiting in queue
+                wait_time = (datetime.now() - queued.queued_at).total_seconds()
+                if wait_time > self.request_timeout:
+                    logger.warning(
+                        f"Request {queued.request.request_id} expired after "
+                        f"{wait_time:.1f}s in queue (timeout: {self.request_timeout}s)"
+                    )
+                    if queued.request.request_id in self._requests:
+                        del self._requests[queued.request.request_id]
+                    # Mark as timed out so worker can send appropriate error
+                    queued.cancelled = True
+                    queued.timeout_expired = True
+                    # Still return it so worker can notify client
+                    if not self._queue:
+                        self._not_empty.clear()
+                    return queued
 
                 # Remove from lookup
                 if queued.request.request_id in self._requests:

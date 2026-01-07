@@ -6,8 +6,54 @@ Defines message types and serialisation for client-server communication.
 import json
 import base64
 from dataclasses import dataclass, field, asdict
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from enum import Enum
+
+
+# Protocol versioning
+# Format: (major, minor) - major version changes break compatibility
+PROTOCOL_VERSION = (1, 0)
+PROTOCOL_VERSION_STRING = f"{PROTOCOL_VERSION[0]}.{PROTOCOL_VERSION[1]}"
+MIN_COMPATIBLE_VERSION = (1, 0)  # Minimum client version server will accept
+
+
+def parse_version(version_str: str) -> Tuple[int, int]:
+    """Parse a version string like '1.0' into a tuple (1, 0)."""
+    try:
+        parts = version_str.split(".")
+        if len(parts) >= 2:
+            return (int(parts[0]), int(parts[1]))
+        elif len(parts) == 1:
+            return (int(parts[0]), 0)
+    except (ValueError, AttributeError):
+        pass
+    return (0, 0)
+
+
+def is_version_compatible(client_version: str) -> Tuple[bool, str]:
+    """
+    Check if a client protocol version is compatible with this server.
+
+    Returns:
+        Tuple of (is_compatible, error_message)
+    """
+    client_ver = parse_version(client_version)
+
+    # Major version must match
+    if client_ver[0] != PROTOCOL_VERSION[0]:
+        return False, (
+            f"Protocol version mismatch: client v{client_version}, "
+            f"server v{PROTOCOL_VERSION_STRING}. Major versions must match."
+        )
+
+    # Client minor version must be >= minimum
+    if client_ver < MIN_COMPATIBLE_VERSION:
+        return False, (
+            f"Client protocol version {client_version} is too old. "
+            f"Minimum required: {MIN_COMPATIBLE_VERSION[0]}.{MIN_COMPATIBLE_VERSION[1]}"
+        )
+
+    return True, ""
 
 
 class MessageType(str, Enum):
@@ -58,6 +104,7 @@ class AuthMessage:
     """Authentication message from client."""
     api_key: str
     client_version: str = "unknown"
+    protocol_version: str = "1.0"  # Protocol version for compatibility checking
 
     def to_json(self) -> str:
         return json.dumps({"type": MessageType.AUTH, **asdict(self)})
@@ -66,7 +113,8 @@ class AuthMessage:
     def from_dict(cls, data: Dict) -> 'AuthMessage':
         return cls(
             api_key=data.get("api_key", ""),
-            client_version=data.get("client_version", "unknown")
+            client_version=data.get("client_version", "unknown"),
+            protocol_version=data.get("protocol_version", "1.0"),
         )
 
 

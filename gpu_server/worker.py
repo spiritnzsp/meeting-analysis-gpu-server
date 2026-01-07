@@ -61,11 +61,46 @@ class GPUWorker:
                 queued = await self.queue.wait_for_request()
 
                 if queued.cancelled:
-                    logger.info(f"Skipping cancelled request: {queued.request.request_id}")
+                    # Check if it was a timeout vs user cancellation
+                    if getattr(queued, 'timeout_expired', False):
+                        logger.info(f"Request timed out in queue: {queued.request.request_id}")
+                        # Notify client of timeout
+                        try:
+                            from .protocol import ErrorMessage
+                            await queued.websocket.send(ErrorMessage(
+                                request_id=queued.request.request_id,
+                                error="Request timed out while waiting in queue",
+                                recoverable=True,
+                            ).to_json())
+                        except Exception as e:
+                            logger.warning(f"Failed to send timeout error: {e}")
+                    else:
+                        logger.info(f"Skipping cancelled request: {queued.request.request_id}")
                     continue
 
-                # Process the request
-                await self._process_request(queued)
+                # Process the request with timeout
+                processing_timeout = self.config.queue.processing_timeout
+                try:
+                    await asyncio.wait_for(
+                        self._process_request(queued),
+                        timeout=processing_timeout
+                    )
+                except asyncio.TimeoutError:
+                    logger.error(
+                        f"Request {queued.request.request_id} timed out after "
+                        f"{processing_timeout}s of processing"
+                    )
+                    # Send timeout error to client
+                    try:
+                        from .protocol import ErrorMessage
+                        await queued.websocket.send(ErrorMessage(
+                            request_id=queued.request.request_id,
+                            error=f"Processing timed out after {processing_timeout} seconds",
+                            recoverable=False,
+                        ).to_json())
+                    except Exception as e:
+                        logger.warning(f"Failed to send processing timeout error: {e}")
+                    self._current_request = None
 
             except asyncio.CancelledError:
                 logger.info("Worker cancelled")

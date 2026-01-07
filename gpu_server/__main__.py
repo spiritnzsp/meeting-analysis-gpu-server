@@ -10,7 +10,7 @@ import signal
 import sys
 from pathlib import Path
 
-from .config import load_config, setup_logging
+from .config import load_config, setup_logging, validate_config, ConfigurationError
 from .server import GPUServer
 
 logger = logging.getLogger(__name__)
@@ -46,6 +46,12 @@ def parse_args():
         help="Log level (overrides config)",
     )
 
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Fail on configuration errors instead of using defaults (recommended for production)",
+    )
+
     return parser.parse_args()
 
 
@@ -70,6 +76,13 @@ async def main():
     logger.info("=" * 60)
     logger.info("Meeting Analysis GPU Server")
     logger.info("=" * 60)
+
+    # Validate configuration
+    try:
+        validate_config(config, strict=args.strict)
+    except ConfigurationError as e:
+        logger.error(f"Configuration validation failed:\n{e}")
+        sys.exit(1)
 
     # Check GPU availability
     try:

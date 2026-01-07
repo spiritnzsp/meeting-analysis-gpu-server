@@ -7,19 +7,30 @@ server:
   port: 8765
   # Maximum concurrent connections
   max_connections: 10
+  # Maximum message size in bytes (100MB default)
+  max_message_size: 104857600
+  # Rate limiting (per client)
+  rate_limit_requests: 10  # Max requests per window
+  rate_limit_window: 60    # Window in seconds
 
 auth:
   # Enable API key authentication (recommended for remote access)
   enabled: true
-  # List of valid API keys (generate with: python -c "import secrets; print(secrets.token_urlsafe(32))")
+  # List of valid API keys (plaintext - will be hashed on load)
+  # Generate with: python -c "import secrets; print(secrets.token_urlsafe(32))"
   api_keys:
     - "CHANGE_ME_generate_a_secure_key"
+  # Pre-hashed API keys (more secure - keys never stored in plaintext)
+  # Generate hash with: python -c "from gpu_server.config import hash_api_key; print(hash_api_key('your_key'))"
+  api_key_hashes: []
 
 queue:
   # Maximum queued requests (additional requests will be rejected)
   max_size: 100
-  # Request timeout in seconds
+  # Request timeout in seconds (requests expire if they wait in queue longer than this)
   request_timeout: 3600  # 1 hour
+  # Processing timeout in seconds (max time for active processing)
+  processing_timeout: 1800  # 30 minutes
 
 whisper:
   # Model size: tiny, base, small, medium, large-v2, large-v3
@@ -47,3 +58,16 @@ logging:
   level: "INFO"
   # Log file (null for stdout only)
   file: null
+
+tls:
+  # Enable TLS/SSL encryption (HIGHLY RECOMMENDED for remote access)
+  enabled: false
+  # Path to certificate file (.pem or .crt)
+  # Generate self-signed cert: openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes
+  cert_file: null
+  # Path to private key file (.pem or .key)
+  key_file: null
+  # Optional: CA certificate for client verification (mTLS)
+  ca_file: null
+  # Require client certificates (mTLS)
+  require_client_cert: false

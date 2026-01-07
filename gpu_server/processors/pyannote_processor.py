@@ -3,10 +3,12 @@ PyAnnote Speaker Diarization Processor
 
 GPU-accelerated speaker diarization and embedding extraction.
 """
+import asyncio
 import logging
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Optional, List, Dict, Callable, Awaitable
+from typing import Optional, List, Dict, Callable, Awaitable, Tuple
 
 import numpy as np
 
@@ -17,6 +19,9 @@ from ..protocol import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Dedicated thread pool for GPU operations to avoid blocking event loop
+_gpu_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pyannote_gpu")
 
 
 class PyAnnoteProcessor:
@@ -40,8 +45,8 @@ class PyAnnoteProcessor:
         self._pipeline = None
         self._embedding_model = None
 
-    def _ensure_pipeline(self):
-        """Load the diarization pipeline if not already loaded."""
+    def _ensure_pipeline_sync(self):
+        """Load the diarization pipeline if not already loaded (synchronous, runs in executor)."""
         if self._pipeline is not None:
             return
 
@@ -83,8 +88,8 @@ class PyAnnoteProcessor:
             logger.error(f"Failed to load PyAnnote pipeline: {e}")
             raise
 
-    def _ensure_embedding_model(self):
-        """Load the embedding model if not already loaded."""
+    def _ensure_embedding_model_sync(self):
+        """Load the embedding model if not already loaded (synchronous, runs in executor)."""
         if self._embedding_model is not None:
             return
 
@@ -109,6 +114,43 @@ class PyAnnoteProcessor:
             logger.error(f"Failed to load embedding model: {e}")
             raise
 
+    def _diarize_sync(
+        self,
+        audio_path: Path,
+        num_speakers: Optional[int],
+    ) -> List[DiarizationSegment]:
+        """
+        Synchronous diarization (runs in executor).
+
+        Returns:
+            List of DiarizationSegment with normalized speaker labels
+        """
+        # Run diarization
+        diarization_params = {}
+        if num_speakers:
+            diarization_params['num_speakers'] = num_speakers
+
+        diarization = self._pipeline(str(audio_path), **diarization_params)
+
+        # Convert to segments
+        segments: List[DiarizationSegment] = []
+        for turn, _, speaker in diarization.itertracks(yield_label=True):
+            segments.append(DiarizationSegment(
+                start=turn.start,
+                end=turn.end,
+                speaker=speaker,
+            ))
+
+        # Normalize speaker labels (SPEAKER_00 -> Person-1)
+        speaker_map = {}
+        for seg in segments:
+            if seg.speaker not in speaker_map:
+                speaker_map[seg.speaker] = f"Person-{len(speaker_map) + 1}"
+            seg.speaker = speaker_map[seg.speaker]
+
+        logger.info(f"Diarization complete: {len(segments)} segments, {len(speaker_map)} speakers")
+        return segments
+
     async def diarize(
         self,
         audio_data: bytes,
@@ -117,7 +159,7 @@ class PyAnnoteProcessor:
         request_id: str = "",
     ) -> List[DiarizationSegment]:
         """
-        Perform speaker diarization on audio.
+        Perform speaker diarization on audio (non-blocking).
 
         Args:
             audio_data: Raw audio bytes
@@ -128,7 +170,13 @@ class PyAnnoteProcessor:
         Returns:
             List of DiarizationSegment
         """
-        self._ensure_pipeline()
+        loop = asyncio.get_running_loop()
+
+        # Load pipeline in executor (blocking operation)
+        await loop.run_in_executor(
+            _gpu_executor,
+            self._ensure_pipeline_sync,
+        )
 
         # Write audio to temp file
         with tempfile.NamedTemporaryFile(suffix=".opus", delete=False) as f:
@@ -144,42 +192,97 @@ class PyAnnoteProcessor:
                     message="Starting diarization..."
                 ))
 
-            # Run diarization
-            diarization_params = {}
-            if num_speakers:
-                diarization_params['num_speakers'] = num_speakers
-
-            diarization = self._pipeline(str(audio_path), **diarization_params)
-
-            # Convert to segments
-            segments: List[DiarizationSegment] = []
-            for turn, _, speaker in diarization.itertracks(yield_label=True):
-                segments.append(DiarizationSegment(
-                    start=turn.start,
-                    end=turn.end,
-                    speaker=speaker,
-                ))
-
-            # Normalize speaker labels (SPEAKER_00 -> Person-1)
-            speaker_map = {}
-            for seg in segments:
-                if seg.speaker not in speaker_map:
-                    speaker_map[seg.speaker] = f"Person-{len(speaker_map) + 1}"
-                seg.speaker = speaker_map[seg.speaker]
+            # Run diarization in executor (blocking GPU operation)
+            segments = await loop.run_in_executor(
+                _gpu_executor,
+                self._diarize_sync,
+                audio_path,
+                num_speakers,
+            )
 
             if progress_callback:
+                # Count unique speakers
+                unique_speakers = len(set(seg.speaker for seg in segments))
                 await progress_callback(ProgressMessage(
                     request_id=request_id,
                     stage=ProcessingStage.DIARIZING,
                     percent=75,
-                    message=f"Diarization complete: {len(speaker_map)} speakers"
+                    message=f"Diarization complete: {unique_speakers} speakers"
                 ))
 
-            logger.info(f"Diarization complete: {len(segments)} segments, {len(speaker_map)} speakers")
             return segments
 
         finally:
             audio_path.unlink(missing_ok=True)
+
+    def _extract_embeddings_sync(
+        self,
+        audio_path: Path,
+        diarization_segments: List[DiarizationSegment],
+        meeting_id: str,
+    ) -> List[SpeakerEmbedding]:
+        """
+        Synchronous embedding extraction (runs in executor).
+
+        Returns:
+            List of SpeakerEmbedding (one per unique speaker)
+        """
+        import torch
+        import torchaudio
+        from pyannote.audio import Inference
+
+        # Load audio
+        waveform, sample_rate = torchaudio.load(str(audio_path))
+
+        # Create inference object
+        inference = Inference(self._embedding_model, window="whole")
+
+        # Group segments by speaker
+        speaker_segments: Dict[str, List[DiarizationSegment]] = {}
+        for seg in diarization_segments:
+            if seg.speaker not in speaker_segments:
+                speaker_segments[seg.speaker] = []
+            speaker_segments[seg.speaker].append(seg)
+
+        embeddings: List[SpeakerEmbedding] = []
+
+        for speaker, segs in speaker_segments.items():
+            # Find best segment (longest, for better embedding quality)
+            best_seg = max(segs, key=lambda s: s.end - s.start)
+            duration = best_seg.end - best_seg.start
+
+            # Skip very short segments
+            if duration < 1.0:
+                logger.warning(f"Skipping short segment for {speaker}: {duration:.1f}s")
+                continue
+
+            try:
+                # Extract segment audio
+                start_sample = int(best_seg.start * sample_rate)
+                end_sample = int(best_seg.end * sample_rate)
+                segment_audio = waveform[:, start_sample:end_sample]
+
+                # Get embedding
+                with torch.no_grad():
+                    embedding = inference({"waveform": segment_audio, "sample_rate": sample_rate})
+
+                # Convert to list for JSON serialization
+                embedding_list = embedding.flatten().tolist()
+
+                embeddings.append(SpeakerEmbedding(
+                    speaker_label=speaker,
+                    meeting_id=meeting_id,
+                    segment_start=best_seg.start,
+                    segment_duration=duration,
+                    embedding=embedding_list,
+                    quality_score=min(1.0, duration / 10.0),  # Longer = better quality
+                ))
+
+            except Exception as e:
+                logger.warning(f"Failed to extract embedding for {speaker}: {e}")
+
+        logger.info(f"Extracted {len(embeddings)} speaker embeddings")
+        return embeddings
 
     async def extract_embeddings(
         self,
@@ -190,7 +293,7 @@ class PyAnnoteProcessor:
         request_id: str = "",
     ) -> List[SpeakerEmbedding]:
         """
-        Extract speaker embeddings from audio.
+        Extract speaker embeddings from audio (non-blocking).
 
         Args:
             audio_data: Raw audio bytes
@@ -202,7 +305,13 @@ class PyAnnoteProcessor:
         Returns:
             List of SpeakerEmbedding (one per unique speaker)
         """
-        self._ensure_embedding_model()
+        loop = asyncio.get_running_loop()
+
+        # Load embedding model in executor (blocking operation)
+        await loop.run_in_executor(
+            _gpu_executor,
+            self._ensure_embedding_model_sync,
+        )
 
         # Write audio to temp file
         with tempfile.NamedTemporaryFile(suffix=".opus", delete=False) as f:
@@ -218,59 +327,14 @@ class PyAnnoteProcessor:
                     message="Extracting speaker embeddings..."
                 ))
 
-            import torch
-            import torchaudio
-            from pyannote.audio import Inference
-
-            # Load audio
-            waveform, sample_rate = torchaudio.load(str(audio_path))
-
-            # Create inference object
-            inference = Inference(self._embedding_model, window="whole")
-
-            # Group segments by speaker
-            speaker_segments: Dict[str, List[DiarizationSegment]] = {}
-            for seg in diarization_segments:
-                if seg.speaker not in speaker_segments:
-                    speaker_segments[seg.speaker] = []
-                speaker_segments[seg.speaker].append(seg)
-
-            embeddings: List[SpeakerEmbedding] = []
-
-            for speaker, segs in speaker_segments.items():
-                # Find best segment (longest, for better embedding quality)
-                best_seg = max(segs, key=lambda s: s.end - s.start)
-                duration = best_seg.end - best_seg.start
-
-                # Skip very short segments
-                if duration < 1.0:
-                    logger.warning(f"Skipping short segment for {speaker}: {duration:.1f}s")
-                    continue
-
-                try:
-                    # Extract segment audio
-                    start_sample = int(best_seg.start * sample_rate)
-                    end_sample = int(best_seg.end * sample_rate)
-                    segment_audio = waveform[:, start_sample:end_sample]
-
-                    # Get embedding
-                    with torch.no_grad():
-                        embedding = inference({"waveform": segment_audio, "sample_rate": sample_rate})
-
-                    # Convert to list for JSON serialization
-                    embedding_list = embedding.flatten().tolist()
-
-                    embeddings.append(SpeakerEmbedding(
-                        speaker_label=speaker,
-                        meeting_id=meeting_id,
-                        segment_start=best_seg.start,
-                        segment_duration=duration,
-                        embedding=embedding_list,
-                        quality_score=min(1.0, duration / 10.0),  # Longer = better quality
-                    ))
-
-                except Exception as e:
-                    logger.warning(f"Failed to extract embedding for {speaker}: {e}")
+            # Run embedding extraction in executor (blocking GPU operation)
+            embeddings = await loop.run_in_executor(
+                _gpu_executor,
+                self._extract_embeddings_sync,
+                audio_path,
+                diarization_segments,
+                meeting_id,
+            )
 
             if progress_callback:
                 await progress_callback(ProgressMessage(
@@ -280,7 +344,6 @@ class PyAnnoteProcessor:
                     message=f"Extracted {len(embeddings)} embeddings"
                 ))
 
-            logger.info(f"Extracted {len(embeddings)} speaker embeddings")
             return embeddings
 
         finally:
