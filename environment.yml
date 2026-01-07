@@ -1,0 +1,27 @@
+name: gpu-server
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.10
+  - pip
+
+  # PyTorch with CUDA
+  - pytorch>=2.0
+  - torchaudio>=2.0
+  - pytorch-cuda=11.8
+
+  # Core
+  - numpy>=1.24
+  - pyyaml>=6.0
+
+  # pip packages (not in conda)
+  - pip:
+    - websockets>=12.0
+    - faster-whisper>=1.0.0
+    - pyannote.audio>=3.1.0
+    - pytest>=7.0.0
+    - pytest-asyncio>=0.21.0

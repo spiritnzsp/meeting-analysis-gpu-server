@@ -1,0 +1,49 @@
+# Meeting Analysis GPU Server Configuration
+
+server:
+  # Host to bind to (0.0.0.0 for all interfaces)
+  host: "0.0.0.0"
+  # WebSocket port
+  port: 8765
+  # Maximum concurrent connections
+  max_connections: 10
+
+auth:
+  # Enable API key authentication (recommended for remote access)
+  enabled: true
+  # List of valid API keys (generate with: python -c "import secrets; print(secrets.token_urlsafe(32))")
+  api_keys:
+    - "CHANGE_ME_generate_a_secure_key"
+
+queue:
+  # Maximum queued requests (additional requests will be rejected)
+  max_size: 100
+  # Request timeout in seconds
+  request_timeout: 3600  # 1 hour
+
+whisper:
+  # Model size: tiny, base, small, medium, large-v2, large-v3
+  model: "large-v3"
+  # Device: cuda, cpu
+  device: "cuda"
+  # Compute type: float16, int8, int8_float16 (float16 recommended for GPU)
+  compute_type: "float16"
+  # Beam size for decoding
+  beam_size: 5
+  # Language (null for auto-detect)
+  language: null
+
+pyannote:
+  # Device: cuda, cpu
+  device: "cuda"
+  # HuggingFace token (required - get from https://huggingface.co/settings/tokens)
+  # Must accept license at: https://huggingface.co/pyannote/speaker-diarization-3.1
+  huggingface_token: "hf_YOUR_TOKEN_HERE"
+  # Diarization model
+  model: "pyannote/speaker-diarization-3.1"
+
+logging:
+  # Log level: DEBUG, INFO, WARNING, ERROR
+  level: "INFO"
+  # Log file (null for stdout only)
+  file: null

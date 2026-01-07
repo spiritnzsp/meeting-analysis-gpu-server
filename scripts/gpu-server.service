@@ -1,0 +1,34 @@
+# Systemd service file for GPU Server
+# Install: sudo cp gpu-server.service /etc/systemd/system/
+# Enable:  sudo systemctl enable gpu-server
+# Start:   sudo systemctl start gpu-server
+# Status:  sudo systemctl status gpu-server
+# Logs:    journalctl -u gpu-server -f
+
+[Unit]
+Description=Meeting Analysis GPU Server
+After=network.target
+
+[Service]
+Type=simple
+User=sean
+Group=sean
+WorkingDirectory=/home/sean/Dev/src/python/meeting-analysis-gpu-server
+
+# Conda environment activation
+ExecStart=/bin/bash -c 'source /opt/anaconda3/etc/profile.d/conda.sh && conda activate gpu-server && python -m gpu_server --config /home/sean/.config/gpu-server/config.yaml'
+
+# Restart on failure
+Restart=on-failure
+RestartSec=10
+
+# Environment
+Environment="CUDA_VISIBLE_DEVICES=0"
+Environment="PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512"
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
