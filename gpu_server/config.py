@@ -11,37 +11,98 @@ import yaml
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
 
+# Argon2 parameters for API key hashing (OWASP recommended for high-security)
+# These are intentionally slow to prevent brute-force attacks
+ARGON2_TIME_COST = 3        # Number of iterations
+ARGON2_MEMORY_COST = 65536  # 64 MiB memory
+ARGON2_PARALLELISM = 4      # Parallel threads
+ARGON2_HASH_LEN = 32        # Output hash length
+ARGON2_SALT_LEN = 16        # Salt length
+
+# Note: Secure memory zeroing is not implemented because Python's string
+# immutability makes it ineffective. Strings cannot be modified in place,
+# and any "zeroing" would just zero a copy. For sensitive data, minimize
+# exposure time and let garbage collection handle cleanup.
+
+
+def _is_argon2_hash(hash_str: str) -> bool:
+    """Check if a hash string is in argon2 format."""
+    return hash_str.startswith('$argon2')
+
+
+def _is_legacy_sha256_hash(hash_str: str) -> bool:
+    """Check if a hash string is a legacy SHA-256 hash (64 hex chars)."""
+    if len(hash_str) != 64:
+        return False
+    try:
+        int(hash_str, 16)
+        return True
+    except ValueError:
+        return False
+
+
+def _hash_api_key_legacy(api_key: str) -> str:
+    """
+    Legacy SHA-256 hashing for backward compatibility.
+
+    DEPRECATED: Use hash_api_key() which uses argon2.
+    This is only used for verifying existing SHA-256 hashes.
+    """
+    salted = f"gpu-server-v1:{api_key}"
+    return hashlib.sha256(salted.encode('utf-8')).hexdigest()
+
+
 def hash_api_key(api_key: str) -> str:
     """
-    Hash an API key for secure storage.
+    Hash an API key for secure storage using argon2id.
 
-    Uses SHA-256 with a constant salt prefix to prevent rainbow table attacks
-    while keeping hashes deterministic for comparison.
+    Argon2id is the recommended algorithm for password/key hashing as it's
+    resistant to both GPU and side-channel attacks.
 
     Args:
         api_key: The plaintext API key
 
     Returns:
-        Hex-encoded hash of the API key
+        Argon2id hash of the API key (includes salt, params, and hash)
     """
-    # Use a fixed prefix as salt (deterministic for comparisons)
-    # This prevents rainbow table attacks while allowing hash comparison
-    salted = f"gpu-server-v1:{api_key}"
-    return hashlib.sha256(salted.encode('utf-8')).hexdigest()
+    try:
+        from argon2 import PasswordHasher
+        from argon2.profiles import RFC_9106_LOW_MEMORY
+
+        # Use argon2id with secure parameters
+        ph = PasswordHasher(
+            time_cost=ARGON2_TIME_COST,
+            memory_cost=ARGON2_MEMORY_COST,
+            parallelism=ARGON2_PARALLELISM,
+            hash_len=ARGON2_HASH_LEN,
+            salt_len=ARGON2_SALT_LEN,
+        )
+
+        return ph.hash(api_key)
+    except ImportError:
+        # Fallback to SHA-256 if argon2 not installed (with warning)
+        logger.warning(
+            "argon2-cffi not installed, falling back to SHA-256. "
+            "Install argon2-cffi for secure API key hashing: pip install argon2-cffi"
+        )
+        return _hash_api_key_legacy(api_key)
 
 
 def verify_api_key(provided_key: str, stored_hashes: List[str]) -> bool:
     """
-    Verify an API key using constant-time comparison.
+    Verify an API key against stored hashes.
+
+    Supports both argon2 (preferred) and legacy SHA-256 hashes for
+    backward compatibility. Uses constant-time comparison.
 
     Args:
         provided_key: The API key provided by the client
-        stored_hashes: List of valid API key hashes
+        stored_hashes: List of valid API key hashes (argon2 or SHA-256)
 
     Returns:
         True if the key is valid, False otherwise
@@ -49,15 +110,54 @@ def verify_api_key(provided_key: str, stored_hashes: List[str]) -> bool:
     if not provided_key or not stored_hashes:
         return False
 
-    provided_hash = hash_api_key(provided_key)
-
-    # Check against all stored hashes using constant-time comparison
-    # We iterate through ALL hashes to prevent timing attacks
     valid = False
-    for stored_hash in stored_hashes:
-        if hmac.compare_digest(provided_hash, stored_hash):
-            valid = True
-        # Don't break early - check all to maintain constant time
+    legacy_hash_found = False
+
+    try:
+        from argon2 import PasswordHasher
+        from argon2.exceptions import VerifyMismatchError, InvalidHashError
+
+        ph = PasswordHasher(
+            time_cost=ARGON2_TIME_COST,
+            memory_cost=ARGON2_MEMORY_COST,
+            parallelism=ARGON2_PARALLELISM,
+            hash_len=ARGON2_HASH_LEN,
+            salt_len=ARGON2_SALT_LEN,
+        )
+
+        # Check against all stored hashes
+        # We iterate through ALL hashes to prevent timing attacks
+        for stored_hash in stored_hashes:
+            if _is_argon2_hash(stored_hash):
+                # Argon2 hash - use argon2 verification
+                try:
+                    ph.verify(stored_hash, provided_key)
+                    valid = True
+                    # Don't break - continue checking to maintain constant time
+                except (VerifyMismatchError, InvalidHashError):
+                    pass
+            elif _is_legacy_sha256_hash(stored_hash):
+                # Legacy SHA-256 hash - use legacy verification
+                legacy_hash_found = True
+                provided_legacy_hash = _hash_api_key_legacy(provided_key)
+                if hmac.compare_digest(provided_legacy_hash, stored_hash):
+                    valid = True
+                    # Don't break - continue checking
+    except ImportError:
+        # argon2 not installed, fall back to legacy verification only
+        provided_legacy_hash = _hash_api_key_legacy(provided_key)
+        for stored_hash in stored_hashes:
+            if _is_legacy_sha256_hash(stored_hash):
+                legacy_hash_found = True
+                if hmac.compare_digest(provided_legacy_hash, stored_hash):
+                    valid = True
+
+    # Log deprecation warning if legacy hashes are still in use
+    if legacy_hash_found and valid:
+        logger.warning(
+            "API key verified using legacy SHA-256 hash. "
+            "Please regenerate API keys and use argon2 hashes for improved security."
+        )
 
     return valid
 
@@ -79,9 +179,12 @@ class ServerConfig:
     port: int = 8765
     max_connections: int = 10
     max_message_size: int = 100 * 1024 * 1024  # 100MB default
-    # Rate limiting
-    rate_limit_requests: int = 10  # Max requests per window
+    # Rate limiting for PROCESS requests (stricter)
+    rate_limit_requests: int = 10  # Max PROCESS requests per window
     rate_limit_window: int = 60  # Window in seconds
+    # Rate limiting for ALL messages (DoS protection)
+    rate_limit_messages: int = 100  # Max messages per second per connection
+    rate_limit_messages_window: int = 1  # Window in seconds (1 = per second)
 
 
 @dataclass
@@ -147,15 +250,20 @@ class Config:
     tls: TLSConfig = field(default_factory=TLSConfig)
 
 
-def load_config(config_path: Optional[Path] = None) -> Config:
+def load_config(config_path: Optional[Path] = None, fail_on_error: bool = True) -> Config:
     """
     Load configuration from YAML file.
 
     Args:
         config_path: Path to config file. If None, searches default locations.
+        fail_on_error: If True (default), raise ConfigurationError on parse errors.
+            If False, log error and continue with defaults.
 
     Returns:
         Config object with loaded values.
+
+    Raises:
+        ConfigurationError: If fail_on_error is True and config file cannot be parsed.
     """
     # Default search paths
     search_paths = [
@@ -192,6 +300,8 @@ def load_config(config_path: Optional[Path] = None) -> Config:
                     max_message_size=data['server'].get('max_message_size', config.server.max_message_size),
                     rate_limit_requests=data['server'].get('rate_limit_requests', config.server.rate_limit_requests),
                     rate_limit_window=data['server'].get('rate_limit_window', config.server.rate_limit_window),
+                    rate_limit_messages=data['server'].get('rate_limit_messages', config.server.rate_limit_messages),
+                    rate_limit_messages_window=data['server'].get('rate_limit_messages_window', config.server.rate_limit_messages_window),
                 )
 
             # Auth config
@@ -246,8 +356,11 @@ def load_config(config_path: Optional[Path] = None) -> Config:
                 )
 
         except Exception as e:
-            logger.error(f"Error loading config file: {e}")
-            logger.info("Using default configuration")
+            if fail_on_error:
+                raise ConfigurationError(f"Failed to parse config file '{config_file}': {e}") from e
+            else:
+                logger.error(f"Error loading config file: {e}")
+                logger.info("Using default configuration")
     else:
         logger.warning("No configuration file found, using defaults")
 
@@ -255,11 +368,21 @@ def load_config(config_path: Optional[Path] = None) -> Config:
     if os.environ.get('GPU_SERVER_HOST'):
         config.server.host = os.environ['GPU_SERVER_HOST']
     if os.environ.get('GPU_SERVER_PORT'):
-        config.server.port = int(os.environ['GPU_SERVER_PORT'])
+        try:
+            config.server.port = int(os.environ['GPU_SERVER_PORT'])
+        except ValueError:
+            raise ConfigurationError(
+                f"Invalid GPU_SERVER_PORT environment variable: '{os.environ['GPU_SERVER_PORT']}'. "
+                "Must be a valid integer."
+            )
     if os.environ.get('GPU_SERVER_API_KEY'):
-        config.auth.api_keys.append(os.environ['GPU_SERVER_API_KEY'])
+        # Read and immediately clear sensitive env var
+        api_key = os.environ.pop('GPU_SERVER_API_KEY')
+        config.auth.api_keys.append(api_key)
+        del api_key  # Clear reference to minimize exposure time
     if os.environ.get('HUGGINGFACE_TOKEN'):
-        config.pyannote.huggingface_token = os.environ['HUGGINGFACE_TOKEN']
+        # Read and immediately clear sensitive env var (consistent with API key handling)
+        config.pyannote.huggingface_token = os.environ.pop('HUGGINGFACE_TOKEN')
 
     # TLS environment variable overrides
     if os.environ.get('GPU_SERVER_TLS_ENABLED'):
@@ -278,9 +401,9 @@ def load_config(config_path: Optional[Path] = None) -> Config:
             hashed = hash_api_key(plaintext_key)
             if hashed not in config.auth.api_key_hashes:
                 config.auth.api_key_hashes.append(hashed)
-        # Clear plaintext keys from memory (security best practice)
+        # Clear plaintext keys list
         config.auth.api_keys = []
-        logger.info("Plaintext API keys have been hashed and stored securely")
+        logger.info("Plaintext API keys have been hashed (argon2) and stored securely")
 
     return config
 
@@ -290,13 +413,14 @@ class ConfigurationError(Exception):
     pass
 
 
-def validate_config(config: Config, strict: bool = False):
+def validate_config(config: Config, strict: bool = True):
     """
     Validate configuration for required settings.
 
     Args:
         config: The configuration to validate
-        strict: If True, raises ConfigurationError for issues. If False, logs warnings.
+        strict: If True (default), raises ConfigurationError for critical issues.
+                If False, logs errors but continues (not recommended for production).
 
     Raises:
         ConfigurationError: If strict=True and validation fails
@@ -304,9 +428,12 @@ def validate_config(config: Config, strict: bool = False):
     errors = []
     warnings = []
 
-    # Auth validation
+    # Auth validation - this is CRITICAL, always an error
     if config.auth.enabled and not config.auth.api_key_hashes:
-        errors.append("Authentication is enabled but no API keys are configured")
+        errors.append(
+            "Authentication is enabled but no API keys are configured. "
+            "Either add API keys or set auth.enabled=False"
+        )
 
     # TLS validation
     if config.tls.enabled:
@@ -328,6 +455,46 @@ def validate_config(config: Config, strict: bool = False):
         errors.append(f"max_message_size too small (minimum 1MB): {config.server.max_message_size}")
     if config.server.max_message_size > 500 * 1024 * 1024:  # Maximum 500MB
         warnings.append(f"max_message_size very large ({config.server.max_message_size / 1024 / 1024:.0f}MB), may cause memory issues")
+
+    # Whisper config validation
+    valid_whisper_models = {
+        "tiny", "tiny.en", "base", "base.en", "small", "small.en",
+        "medium", "medium.en", "large", "large-v1", "large-v2", "large-v3",
+    }
+    if config.whisper.model not in valid_whisper_models:
+        errors.append(
+            f"Invalid whisper.model: '{config.whisper.model}'. "
+            f"Must be one of: {', '.join(sorted(valid_whisper_models))}"
+        )
+    valid_compute_types = {'float16', 'float32', 'int8', 'int8_float16', 'int8_float32'}
+    if config.whisper.compute_type not in valid_compute_types:
+        errors.append(
+            f"Invalid whisper.compute_type: '{config.whisper.compute_type}'. "
+            f"Must be one of: {', '.join(sorted(valid_compute_types))}"
+        )
+    if config.whisper.beam_size < 1 or config.whisper.beam_size > 10:
+        errors.append(
+            f"Invalid whisper.beam_size: {config.whisper.beam_size}. "
+            "Must be between 1 and 10"
+        )
+
+    # Device validation for both Whisper and PyAnnote
+    valid_device_patterns = {'cpu', 'cuda'}
+    for name, device in [('whisper', config.whisper.device), ('pyannote', config.pyannote.device)]:
+        # Allow "cpu", "cuda", or "cuda:N" where N is a digit
+        if device not in valid_device_patterns:
+            if device.startswith('cuda:'):
+                suffix = device[5:]
+                if not suffix.isdigit():
+                    errors.append(
+                        f"Invalid {name}.device: '{device}'. "
+                        "Must be 'cpu', 'cuda', or 'cuda:N' where N is a GPU index"
+                    )
+            else:
+                errors.append(
+                    f"Invalid {name}.device: '{device}'. "
+                    "Must be 'cpu', 'cuda', or 'cuda:N' where N is a GPU index"
+                )
 
     # Log warnings
     for warning in warnings:

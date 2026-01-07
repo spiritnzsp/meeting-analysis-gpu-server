@@ -2,6 +2,7 @@
 websockets>=12.0
 pyyaml>=6.0
 numpy>=1.24.0
+argon2-cffi>=23.1.0  # Secure API key hashing
 
 # PyTorch (install with CUDA support for GPU acceleration)
 # Install manually with: pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu118

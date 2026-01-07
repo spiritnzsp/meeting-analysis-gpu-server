@@ -5,15 +5,15 @@ Run with: python -m gpu_server
 """
 import argparse
 import asyncio
-import logging
 import signal
 import sys
 from pathlib import Path
 
-from .config import load_config, setup_logging, validate_config, ConfigurationError
+from .config import load_config, validate_config, ConfigurationError
 from .server import GPUServer
+from .logging_config import configure_logging, get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 def parse_args():
@@ -47,9 +47,21 @@ def parse_args():
     )
 
     parser.add_argument(
-        "--strict",
+        "--no-strict",
         action="store_true",
-        help="Fail on configuration errors instead of using defaults (recommended for production)",
+        help="Continue despite configuration errors (not recommended for production)",
+    )
+
+    parser.add_argument(
+        "--json-logs",
+        action="store_true",
+        help="Output logs in JSON format (recommended for production/log aggregation)",
+    )
+
+    parser.add_argument(
+        "--no-color",
+        action="store_true",
+        help="Disable colored console output",
     )
 
     return parser.parse_args()
@@ -70,16 +82,20 @@ async def main():
     if args.log_level:
         config.logging.level = args.log_level
 
-    # Setup logging
-    setup_logging(config.logging)
+    # Setup structured logging
+    configure_logging(
+        level=config.logging.level,
+        json_format=args.json_logs,
+        use_colors=not args.no_color,
+    )
 
     logger.info("=" * 60)
     logger.info("Meeting Analysis GPU Server")
     logger.info("=" * 60)
 
-    # Validate configuration
+    # Validate configuration (strict=True by default)
     try:
-        validate_config(config, strict=args.strict)
+        validate_config(config, strict=not args.no_strict)
     except ConfigurationError as e:
         logger.error(f"Configuration validation failed:\n{e}")
         sys.exit(1)
@@ -100,7 +116,7 @@ async def main():
     server = GPUServer(config)
 
     # Setup signal handlers for graceful shutdown
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     shutdown_event = asyncio.Event()
 
     def signal_handler():

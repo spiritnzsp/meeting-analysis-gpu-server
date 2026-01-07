@@ -3,11 +3,23 @@ WebSocket Protocol Definitions
 
 Defines message types and serialisation for client-server communication.
 """
+import binascii
 import json
 import base64
 from dataclasses import dataclass, field, asdict
 from typing import Optional, List, Dict, Any, Tuple
 from enum import Enum
+
+from .validation import (
+    ValidationError,
+    validate_request_id,
+    validate_meeting_name,
+    validate_num_speakers,
+    validate_whisper_model,
+    validate_language,
+    validate_priority,
+    validate_audio_data,
+)
 
 
 # Protocol versioning
@@ -72,6 +84,7 @@ class MessageType(str, Enum):
     RESULT = "result"
     ERROR = "error"
     PONG = "pong"
+    CANCELLED = "cancelled"
 
 
 class ProcessingStage(str, Enum):
@@ -140,25 +153,66 @@ class ProcessRequest:
 
     @classmethod
     def from_dict(cls, data: Dict) -> 'ProcessRequest':
-        audio_b64 = data.get("audio_data", "")
-        audio_bytes = base64.b64decode(audio_b64) if audio_b64 else b""
+        """
+        Deserialize a ProcessRequest from a dictionary.
 
+        Args:
+            data: The dictionary to deserialize
+
+        Returns:
+            ProcessRequest instance
+
+        Raises:
+            ValidationError: If any field fails validation
+        """
+        # Decode and validate audio data
+        audio_b64 = data.get("audio_data", "")
+        try:
+            audio_bytes = base64.b64decode(audio_b64) if audio_b64 else b""
+        except (binascii.Error, ValueError):
+            # binascii.Error for invalid base64, ValueError for incorrect padding
+            raise ValidationError("audio_data", "Invalid base64 encoding")
+
+        audio_bytes = validate_audio_data(audio_bytes)
+
+        # Validate request ID
+        request_id = validate_request_id(data.get("request_id", ""))
+
+        # Validate meeting name
+        meeting_name = validate_meeting_name(data.get("meeting_name", ""))
+
+        # Validate priority
+        priority = validate_priority(data.get("priority", 0))
+
+        # Validate and build options
         options_dict = data.get("options", {})
+
+        # Helper to validate boolean options - reject non-boolean types
+        def validate_bool_option(name: str, value, default: bool) -> bool:
+            if value is None:
+                return default
+            if not isinstance(value, bool):
+                raise ValidationError(
+                    f"options.{name}",
+                    f"Must be a boolean (true/false), not {type(value).__name__}"
+                )
+            return value
+
         options = ProcessingOptions(
-            transcribe=options_dict.get("transcribe", True),
-            diarize=options_dict.get("diarize", True),
-            extract_embeddings=options_dict.get("extract_embeddings", True),
-            whisper_model=options_dict.get("whisper_model"),
-            language=options_dict.get("language"),
-            num_speakers=options_dict.get("num_speakers"),
+            transcribe=validate_bool_option("transcribe", options_dict.get("transcribe"), True),
+            diarize=validate_bool_option("diarize", options_dict.get("diarize"), True),
+            extract_embeddings=validate_bool_option("extract_embeddings", options_dict.get("extract_embeddings"), True),
+            whisper_model=validate_whisper_model(options_dict.get("whisper_model")),
+            language=validate_language(options_dict.get("language")),
+            num_speakers=validate_num_speakers(options_dict.get("num_speakers")),
         )
 
         return cls(
-            request_id=data.get("request_id", ""),
+            request_id=request_id,
             audio_data=audio_bytes,
             options=options,
-            priority=data.get("priority", 0),
-            meeting_name=data.get("meeting_name", ""),
+            priority=priority,
+            meeting_name=meeting_name,
         )
 
 
@@ -222,9 +276,10 @@ class ProcessingResult:
     detected_language: str = ""
     error_message: str = ""
     processing_time_seconds: float = 0.0
+    warnings: List[str] = field(default_factory=list)  # Warnings for partial failures
 
     def to_json(self) -> str:
-        return json.dumps({
+        data = {
             "type": MessageType.RESULT,
             "request_id": self.request_id,
             "success": self.success,
@@ -235,7 +290,11 @@ class ProcessingResult:
             "detected_language": self.detected_language,
             "error_message": self.error_message,
             "processing_time_seconds": self.processing_time_seconds,
-        })
+        }
+        # Only include warnings if there are any (backward compatibility)
+        if self.warnings:
+            data["warnings"] = self.warnings
+        return json.dumps(data)
 
 
 @dataclass
@@ -244,22 +303,75 @@ class ErrorMessage:
     request_id: str
     error: str
     recoverable: bool = True
+    error_code: Optional[str] = None  # Optional error code for programmatic handling
 
     def to_json(self) -> str:
-        return json.dumps({
+        data = {
             "type": MessageType.ERROR,
             "request_id": self.request_id,
             "error": self.error,
             "recoverable": self.recoverable,
+        }
+        if self.error_code:
+            data["error_code"] = self.error_code
+        return json.dumps(data)
+
+
+@dataclass
+class AuthErrorMessage:
+    """Authentication error message from server (no request_id)."""
+    error: str
+    error_code: str = "AUTH_ERROR"
+    server_protocol_version: Optional[str] = None
+
+    def to_json(self) -> str:
+        data = {
+            "type": MessageType.AUTH_FAILED,
+            "error": self.error,
+            "error_code": self.error_code,
+        }
+        if self.server_protocol_version:
+            data["server_protocol_version"] = self.server_protocol_version
+        return json.dumps(data)
+
+
+@dataclass
+class CancelledMessage:
+    """Cancellation confirmation message."""
+    request_id: str
+
+    def to_json(self) -> str:
+        return json.dumps({
+            "type": MessageType.CANCELLED,
+            "request_id": self.request_id,
         })
 
 
-def parse_message(data: str) -> Dict[str, Any]:
-    """Parse a JSON message and return as dict with 'type' field."""
+# Maximum JSON message size (defense-in-depth, WebSocket also has limits)
+MAX_JSON_SIZE = 10 * 1024 * 1024  # 10MB for JSON control messages (not binary data)
+
+
+def parse_message(data: str, max_size: int = MAX_JSON_SIZE) -> Dict[str, Any]:
+    """
+    Parse a JSON message and return as dict with 'type' field.
+
+    Args:
+        data: JSON string to parse
+        max_size: Maximum allowed size in bytes (default 10MB)
+
+    Returns:
+        Parsed message dict with 'type' field, or error dict
+    """
+    # Size limit check (defense-in-depth)
+    if len(data) > max_size:
+        return {"type": "error", "error": f"Message too large ({len(data)} bytes, max {max_size})"}
+
     try:
         msg = json.loads(data)
         if "type" not in msg:
             return {"type": "error", "error": "Missing message type"}
         return msg
-    except json.JSONDecodeError as e:
-        return {"type": "error", "error": f"Invalid JSON: {e}"}
+    except json.JSONDecodeError:
+        return {"type": "error", "error": "Invalid JSON format"}
+    except RecursionError:
+        return {"type": "error", "error": "JSON nesting depth exceeded"}

@@ -4,8 +4,8 @@ PyAnnote Speaker Diarization Processor
 GPU-accelerated speaker diarization and embedding extraction.
 """
 import asyncio
-import logging
-import tempfile
+import math
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional, List, Dict, Callable, Awaitable, Tuple
@@ -17,11 +17,14 @@ from ..protocol import (
     DiarizationSegment, SpeakerEmbedding, TranscriptSegment,
     ProgressMessage, ProcessingStage
 )
+from ..logging_config import get_logger, LogEvents
+from ..utils.temp_file import TempAudioFile
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
-# Dedicated thread pool for GPU operations to avoid blocking event loop
-_gpu_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pyannote_gpu")
+
+# Import from package __init__.py - defined there to avoid duplication
+from . import ProcessorCancelled
 
 
 class PyAnnoteProcessor:
@@ -44,6 +47,19 @@ class PyAnnoteProcessor:
         self.config = config
         self._pipeline = None
         self._embedding_model = None
+        self._shutdown = False
+
+        # Cancellation tracking - use request_id to avoid TOCTOU race
+        self._cancelled_request_id: Optional[str] = None
+        self._cancel_lock = threading.Lock()
+
+        # Operation tracking for safe timeout handling
+        self._operation_complete = asyncio.Event()
+        self._operation_complete.set()  # Initially not processing
+        self._is_processing = False
+
+        # Dedicated thread pool for GPU operations to avoid blocking event loop
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pyannote_gpu")
 
     def _ensure_pipeline_sync(self):
         """Load the diarization pipeline if not already loaded (synchronous, runs in executor)."""
@@ -74,11 +90,13 @@ class PyAnnoteProcessor:
                 use_auth_token=self.config.huggingface_token,
             )
 
-            if self.config.device == "cuda":
+            # Support both "cuda" and "cuda:N" device specifications
+            if self.config.device.startswith("cuda"):
                 import torch
                 if torch.cuda.is_available():
-                    self._pipeline = self._pipeline.to(torch.device("cuda"))
-                    logger.info("PyAnnote pipeline moved to CUDA")
+                    device = torch.device(self.config.device)
+                    self._pipeline = self._pipeline.to(device)
+                    logger.info(f"PyAnnote pipeline moved to {self.config.device}")
                 else:
                     logger.warning("CUDA requested but not available, using CPU")
 
@@ -103,10 +121,13 @@ class PyAnnoteProcessor:
                 use_auth_token=self.config.huggingface_token,
             )
 
-            if self.config.device == "cuda":
+            # Support both "cuda" and "cuda:N" device specifications
+            if self.config.device.startswith("cuda"):
                 import torch
                 if torch.cuda.is_available():
-                    self._embedding_model = self._embedding_model.to(torch.device("cuda"))
+                    device = torch.device(self.config.device)
+                    self._embedding_model = self._embedding_model.to(device)
+                    logger.info(f"PyAnnote embedding model moved to {self.config.device}")
 
             logger.info("PyAnnote embedding model loaded")
 
@@ -114,23 +135,37 @@ class PyAnnoteProcessor:
             logger.error(f"Failed to load embedding model: {e}")
             raise
 
+    def _check_cancelled(self, request_id: str) -> None:
+        """Check if processing was cancelled and raise if so."""
+        with self._cancel_lock:
+            if self._cancelled_request_id == request_id or self._cancelled_request_id == "__ANY__":
+                raise ProcessorCancelled("Processing cancelled")
+
     def _diarize_sync(
         self,
         audio_path: Path,
         num_speakers: Optional[int],
+        request_id: str,
     ) -> List[DiarizationSegment]:
         """
         Synchronous diarization (runs in executor).
 
         Returns:
             List of DiarizationSegment with normalized speaker labels
+
+        Raises:
+            ProcessorCancelled: If cancel event is set
         """
+        self._check_cancelled(request_id)
+
         # Run diarization
         diarization_params = {}
         if num_speakers:
             diarization_params['num_speakers'] = num_speakers
 
         diarization = self._pipeline(str(audio_path), **diarization_params)
+
+        self._check_cancelled(request_id)
 
         # Convert to segments
         segments: List[DiarizationSegment] = []
@@ -169,120 +204,162 @@ class PyAnnoteProcessor:
 
         Returns:
             List of DiarizationSegment
+
+        Raises:
+            RuntimeError: If processor has been shut down
+            ProcessorCancelled: If processing was cancelled
         """
+        if self._shutdown:
+            raise RuntimeError("PyAnnoteProcessor has been shut down")
+
+        # Mark operation as in-progress
+        self._operation_complete.clear()
+        self._is_processing = True
+
+        # Clear any stale cancellation from previous request
+        with self._cancel_lock:
+            self._cancelled_request_id = None
+
         loop = asyncio.get_running_loop()
 
-        # Load pipeline in executor (blocking operation)
-        await loop.run_in_executor(
-            _gpu_executor,
-            self._ensure_pipeline_sync,
-        )
-
-        # Write audio to temp file
-        with tempfile.NamedTemporaryFile(suffix=".opus", delete=False) as f:
-            f.write(audio_data)
-            audio_path = Path(f.name)
-
         try:
-            if progress_callback:
-                await progress_callback(ProgressMessage(
-                    request_id=request_id,
-                    stage=ProcessingStage.DIARIZING,
-                    percent=55,
-                    message="Starting diarization..."
-                ))
-
-            # Run diarization in executor (blocking GPU operation)
-            segments = await loop.run_in_executor(
-                _gpu_executor,
-                self._diarize_sync,
-                audio_path,
-                num_speakers,
+            # Load pipeline in executor (blocking operation)
+            await loop.run_in_executor(
+                self._executor,
+                self._ensure_pipeline_sync,
             )
 
-            if progress_callback:
-                # Count unique speakers
-                unique_speakers = len(set(seg.speaker for seg in segments))
-                await progress_callback(ProgressMessage(
-                    request_id=request_id,
-                    stage=ProcessingStage.DIARIZING,
-                    percent=75,
-                    message=f"Diarization complete: {unique_speakers} speakers"
-                ))
+            # Write audio to temp file with robust cleanup
+            with TempAudioFile(audio_data, suffix=".opus") as audio_path:
+                try:
+                    if progress_callback:
+                        await progress_callback(ProgressMessage(
+                            request_id=request_id,
+                            stage=ProcessingStage.DIARIZING,
+                            percent=55,
+                            message="Starting diarization..."
+                        ))
 
-            return segments
+                    # Run diarization in executor (blocking GPU operation)
+                    segments = await loop.run_in_executor(
+                        self._executor,
+                        self._diarize_sync,
+                        audio_path,
+                        num_speakers,
+                        request_id,
+                    )
 
+                    if progress_callback:
+                        # Count unique speakers
+                        unique_speakers = len(set(seg.speaker for seg in segments))
+                        await progress_callback(ProgressMessage(
+                            request_id=request_id,
+                            stage=ProcessingStage.DIARIZING,
+                            percent=75,
+                            message=f"Diarization complete: {unique_speakers} speakers"
+                        ))
+
+                    return segments
+
+                except ProcessorCancelled:
+                    logger.warning(f"Diarization cancelled for request {request_id}")
+                    raise
+                except asyncio.CancelledError:
+                    logger.warning(f"Diarization async cancelled for request {request_id}")
+                    raise
         finally:
-            audio_path.unlink(missing_ok=True)
+            # Mark operation as complete
+            self._is_processing = False
+            self._operation_complete.set()
 
     def _extract_embeddings_sync(
         self,
         audio_path: Path,
         diarization_segments: List[DiarizationSegment],
         meeting_id: str,
+        request_id: str,
     ) -> List[SpeakerEmbedding]:
         """
         Synchronous embedding extraction (runs in executor).
 
         Returns:
             List of SpeakerEmbedding (one per unique speaker)
+
+        Raises:
+            ProcessorCancelled: If cancel event is set
         """
         import torch
         import torchaudio
         from pyannote.audio import Inference
 
+        self._check_cancelled(request_id)
+
         # Load audio
         waveform, sample_rate = torchaudio.load(str(audio_path))
 
-        # Create inference object
-        inference = Inference(self._embedding_model, window="whole")
+        try:
+            # Create inference object
+            inference = Inference(self._embedding_model, window="whole")
 
-        # Group segments by speaker
-        speaker_segments: Dict[str, List[DiarizationSegment]] = {}
-        for seg in diarization_segments:
-            if seg.speaker not in speaker_segments:
-                speaker_segments[seg.speaker] = []
-            speaker_segments[seg.speaker].append(seg)
+            # Group segments by speaker
+            speaker_segments: Dict[str, List[DiarizationSegment]] = {}
+            for seg in diarization_segments:
+                if seg.speaker not in speaker_segments:
+                    speaker_segments[seg.speaker] = []
+                speaker_segments[seg.speaker].append(seg)
 
-        embeddings: List[SpeakerEmbedding] = []
+            embeddings: List[SpeakerEmbedding] = []
 
-        for speaker, segs in speaker_segments.items():
-            # Find best segment (longest, for better embedding quality)
-            best_seg = max(segs, key=lambda s: s.end - s.start)
-            duration = best_seg.end - best_seg.start
+            for speaker, segs in speaker_segments.items():
+                self._check_cancelled(request_id)
 
-            # Skip very short segments
-            if duration < 1.0:
-                logger.warning(f"Skipping short segment for {speaker}: {duration:.1f}s")
-                continue
+                # Find best segment (longest, for better embedding quality)
+                best_seg = max(segs, key=lambda s: s.end - s.start)
+                duration = best_seg.end - best_seg.start
 
-            try:
-                # Extract segment audio
-                start_sample = int(best_seg.start * sample_rate)
-                end_sample = int(best_seg.end * sample_rate)
-                segment_audio = waveform[:, start_sample:end_sample]
+                # Skip very short segments
+                if duration < 1.0:
+                    logger.warning(f"Skipping short segment for {speaker}: {duration:.1f}s")
+                    continue
 
-                # Get embedding
-                with torch.no_grad():
-                    embedding = inference({"waveform": segment_audio, "sample_rate": sample_rate})
+                try:
+                    # Extract segment audio - use round() for accurate sample boundaries
+                    start_sample = round(best_seg.start * sample_rate)
+                    end_sample = round(best_seg.end * sample_rate)
+                    segment_audio = waveform[:, start_sample:end_sample]
 
-                # Convert to list for JSON serialization
-                embedding_list = embedding.flatten().tolist()
+                    # Get embedding
+                    with torch.no_grad():
+                        embedding = inference({"waveform": segment_audio, "sample_rate": sample_rate})
 
-                embeddings.append(SpeakerEmbedding(
-                    speaker_label=speaker,
-                    meeting_id=meeting_id,
-                    segment_start=best_seg.start,
-                    segment_duration=duration,
-                    embedding=embedding_list,
-                    quality_score=min(1.0, duration / 10.0),  # Longer = better quality
-                ))
+                    # Convert to list for JSON serialization
+                    embedding_list = embedding.flatten().tolist()
 
-            except Exception as e:
-                logger.warning(f"Failed to extract embedding for {speaker}: {e}")
+                    embeddings.append(SpeakerEmbedding(
+                        speaker_label=speaker,
+                        meeting_id=meeting_id,
+                        segment_start=best_seg.start,
+                        segment_duration=duration,
+                        embedding=embedding_list,
+                        quality_score=min(1.0, duration / 10.0),  # Longer = better quality
+                    ))
 
-        logger.info(f"Extracted {len(embeddings)} speaker embeddings")
-        return embeddings
+                    # Explicitly delete segment audio to free memory
+                    del segment_audio
+                    del embedding
+
+                except Exception as e:
+                    logger.warning(f"Failed to extract embedding for {speaker}: {e}")
+
+            logger.info(f"Extracted {len(embeddings)} speaker embeddings")
+            return embeddings
+
+        finally:
+            # Explicitly release waveform tensor to free memory
+            del waveform
+            # Clear GPU cache after processing
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     async def extract_embeddings(
         self,
@@ -304,50 +381,85 @@ class PyAnnoteProcessor:
 
         Returns:
             List of SpeakerEmbedding (one per unique speaker)
+
+        Raises:
+            RuntimeError: If processor has been shut down
+            ProcessorCancelled: If processing was cancelled
         """
+        if self._shutdown:
+            raise RuntimeError("PyAnnoteProcessor has been shut down")
+
+        # Mark operation as in-progress
+        self._operation_complete.clear()
+        self._is_processing = True
+
+        # Clear any stale cancellation from previous requests
+        # This is safe because if cancel was called during diarize(), it would have
+        # already raised ProcessorCancelled there and we wouldn't reach this point.
+        # Any remaining cancellation is from a PREVIOUS request and should be cleared.
+        with self._cancel_lock:
+            self._cancelled_request_id = None
+
         loop = asyncio.get_running_loop()
 
-        # Load embedding model in executor (blocking operation)
-        await loop.run_in_executor(
-            _gpu_executor,
-            self._ensure_embedding_model_sync,
-        )
-
-        # Write audio to temp file
-        with tempfile.NamedTemporaryFile(suffix=".opus", delete=False) as f:
-            f.write(audio_data)
-            audio_path = Path(f.name)
-
         try:
-            if progress_callback:
-                await progress_callback(ProgressMessage(
-                    request_id=request_id,
-                    stage=ProcessingStage.EXTRACTING_EMBEDDINGS,
-                    percent=80,
-                    message="Extracting speaker embeddings..."
-                ))
-
-            # Run embedding extraction in executor (blocking GPU operation)
-            embeddings = await loop.run_in_executor(
-                _gpu_executor,
-                self._extract_embeddings_sync,
-                audio_path,
-                diarization_segments,
-                meeting_id,
+            # Load embedding model in executor (blocking operation)
+            await loop.run_in_executor(
+                self._executor,
+                self._ensure_embedding_model_sync,
             )
 
-            if progress_callback:
-                await progress_callback(ProgressMessage(
-                    request_id=request_id,
-                    stage=ProcessingStage.EXTRACTING_EMBEDDINGS,
-                    percent=90,
-                    message=f"Extracted {len(embeddings)} embeddings"
-                ))
+            # Write audio to temp file with robust cleanup
+            with TempAudioFile(audio_data, suffix=".opus") as audio_path:
+                try:
+                    if progress_callback:
+                        await progress_callback(ProgressMessage(
+                            request_id=request_id,
+                            stage=ProcessingStage.EXTRACTING_EMBEDDINGS,
+                            percent=80,
+                            message="Extracting speaker embeddings..."
+                        ))
 
-            return embeddings
+                    # Run embedding extraction in executor (blocking GPU operation)
+                    embeddings = await loop.run_in_executor(
+                        self._executor,
+                        self._extract_embeddings_sync,
+                        audio_path,
+                        diarization_segments,
+                        meeting_id,
+                        request_id,
+                    )
 
+                    if progress_callback:
+                        await progress_callback(ProgressMessage(
+                            request_id=request_id,
+                            stage=ProcessingStage.EXTRACTING_EMBEDDINGS,
+                            percent=90,
+                            message=f"Extracted {len(embeddings)} embeddings"
+                        ))
+
+                    return embeddings
+
+                except ProcessorCancelled:
+                    logger.warning(f"Embedding extraction cancelled for request {request_id}")
+                    raise
+                except asyncio.CancelledError:
+                    logger.warning(f"Embedding extraction async cancelled for request {request_id}")
+                    raise
         finally:
-            audio_path.unlink(missing_ok=True)
+            # Mark operation as complete
+            self._is_processing = False
+            self._operation_complete.set()
+
+    def _is_valid_timestamp(self, start: float, end: float) -> bool:
+        """Check if timestamps are valid (not NaN, not negative, end >= start)."""
+        if math.isnan(start) or math.isnan(end):
+            return False
+        if start < 0 or end < 0:
+            return False
+        if end < start:
+            return False
+        return True
 
     def align_transcript_with_diarization(
         self,
@@ -364,14 +476,26 @@ class PyAnnoteProcessor:
         Returns:
             Transcript segments with speaker assignments
         """
+        # Filter diarization segments with valid timestamps
+        valid_diarization = [
+            ds for ds in diarization_segments
+            if self._is_valid_timestamp(ds.start, ds.end)
+        ]
+        if len(valid_diarization) != len(diarization_segments):
+            skipped = len(diarization_segments) - len(valid_diarization)
+            logger.warning(f"Skipped {skipped} diarization segments with invalid timestamps")
+
         for ts in transcript_segments:
-            ts_mid = (ts.start + ts.end) / 2
+            # Skip transcript segments with invalid timestamps
+            if not self._is_valid_timestamp(ts.start, ts.end):
+                logger.warning(f"Skipping transcript segment with invalid timestamps: start={ts.start}, end={ts.end}")
+                continue
 
             # Find overlapping diarization segment
             best_speaker = None
             best_overlap = 0
 
-            for ds in diarization_segments:
+            for ds in valid_diarization:
                 # Calculate overlap
                 overlap_start = max(ts.start, ds.start)
                 overlap_end = min(ts.end, ds.end)
@@ -384,6 +508,49 @@ class PyAnnoteProcessor:
             ts.speaker = best_speaker
 
         return transcript_segments
+
+    def cancel(self, request_id: str = "") -> None:
+        """
+        Cancel processing for a specific request.
+
+        Args:
+            request_id: The request ID to cancel. If empty, cancels any in-progress request.
+        """
+        with self._cancel_lock:
+            if request_id:
+                self._cancelled_request_id = request_id
+            elif self._is_processing:
+                # Cancel whatever is currently processing
+                self._cancelled_request_id = "__ANY__"
+        logger.info(f"PyAnnote processor cancellation requested for {request_id or 'current request'}")
+
+    async def wait_for_idle(self, timeout: float = 30.0) -> bool:
+        """
+        Wait for the processor to become idle.
+
+        Use this after cancelling to ensure GPU operations have completed
+        before starting a new request.
+
+        Args:
+            timeout: Maximum time to wait in seconds
+
+        Returns:
+            True if processor is idle, False if timeout occurred
+        """
+        if not self._is_processing:
+            return True
+
+        try:
+            await asyncio.wait_for(self._operation_complete.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout waiting for PyAnnote processor to become idle")
+            return False
+
+    @property
+    def is_processing(self) -> bool:
+        """Check if processor is currently running a GPU operation."""
+        return self._is_processing
 
     def unload(self):
         """Unload models to free GPU memory."""
@@ -404,3 +571,48 @@ class PyAnnoteProcessor:
                 torch.cuda.empty_cache()
         except ImportError:
             pass
+
+    def shutdown(self, timeout: float = 30.0):
+        """
+        Shutdown the processor and release all resources. Safe to call multiple times.
+
+        Args:
+            timeout: Maximum time to wait for executor shutdown (default 30s)
+        """
+        if self._shutdown:
+            return  # Already shut down
+
+        self._shutdown = True
+
+        # Signal cancellation to any running operations
+        self.cancel()
+
+        self.unload()
+
+        # Shutdown the executor with timeout
+        if self._executor is not None:
+            logger.info("Shutting down PyAnnote executor...")
+
+            # Use a thread to implement timeout since ThreadPoolExecutor.shutdown() doesn't have one
+            shutdown_complete = threading.Event()
+
+            def do_shutdown():
+                try:
+                    self._executor.shutdown(wait=True, cancel_futures=False)
+                finally:
+                    shutdown_complete.set()
+
+            shutdown_thread = threading.Thread(target=do_shutdown, daemon=True)
+            shutdown_thread.start()
+
+            if shutdown_complete.wait(timeout=timeout):
+                logger.info("PyAnnote executor shutdown complete")
+            else:
+                logger.warning(
+                    f"PyAnnote executor shutdown timed out after {timeout}s, "
+                    "forcing shutdown (operations may still be running)"
+                )
+                # Force shutdown without waiting
+                self._executor.shutdown(wait=False, cancel_futures=True)
+
+            self._executor = None

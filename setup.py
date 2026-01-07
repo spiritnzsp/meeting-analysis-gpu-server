@@ -22,6 +22,7 @@ setup(
         "torchaudio>=2.0.0",
         "faster-whisper>=1.0.0",
         "pyannote.audio>=3.1.0",
+        "argon2-cffi>=23.1.0",  # Secure password/API key hashing
     ],
     extras_require={
         "dev": [

@@ -5,8 +5,8 @@ Manages the queue of processing requests with priority support.
 """
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
-from datetime import datetime
 from typing import Dict, Optional, Callable, Awaitable
 from heapq import heappush, heappop
 
@@ -22,7 +22,7 @@ class QueuedRequest:
     sort_key: tuple = field(compare=True)
     request: ProcessRequest = field(compare=False)
     websocket: object = field(compare=False)  # WebSocket connection
-    queued_at: datetime = field(compare=False, default_factory=datetime.now)
+    queued_at: float = field(compare=False, default_factory=time.monotonic)  # Monotonic time for reliable timeouts
     cancelled: bool = field(compare=False, default=False)
     timeout_expired: bool = field(compare=False, default=False)  # True if request timed out in queue
 
@@ -58,12 +58,23 @@ class QueueManager:
 
     @property
     def size(self) -> int:
-        """Current queue size."""
+        """Current queue size (approximate, for monitoring only)."""
+        # Note: This is not thread-safe but is acceptable for monitoring/stats
         return len(self._queue)
+
+    def _size_locked(self) -> int:
+        """Get size when lock is already held."""
+        return len(self._queue)
+
+    def _is_full_locked(self) -> bool:
+        """Check if queue is full when lock is already held."""
+        return self._size_locked() >= self.max_size
 
     @property
     def is_full(self) -> bool:
-        """Check if queue is full."""
+        """Check if queue is full (approximate, for monitoring only)."""
+        # Note: This is not thread-safe but is acceptable for monitoring/stats
+        # For actual enqueue decisions, use _is_full_locked() inside the lock
         return self.size >= self.max_size
 
     async def enqueue(
@@ -84,12 +95,13 @@ class QueueManager:
             True if enqueued, False if queue is full
         """
         async with self._lock:
-            if self.is_full:
+            if self._is_full_locked():
                 logger.warning(f"Queue full, rejecting request {request.request_id}")
                 return False
 
             # Create priority tuple: (-priority, timestamp) so higher priority comes first
-            sort_key = (-request.priority, datetime.now().timestamp())
+            # Use monotonic time for consistent ordering regardless of clock adjustments
+            sort_key = (-request.priority, time.monotonic())
 
             queued = QueuedRequest(
                 sort_key=sort_key,
@@ -100,9 +112,10 @@ class QueueManager:
             heappush(self._queue, queued)
             self._requests[request.request_id] = queued
 
+            queue_size = self._size_locked()
             logger.info(
                 f"Enqueued request {request.request_id} "
-                f"(priority={request.priority}, queue_size={self.size})"
+                f"(priority={request.priority}, queue_size={queue_size})"
             )
 
             # Signal that queue is not empty
@@ -114,7 +127,7 @@ class QueueManager:
                     request_id=request.request_id,
                     stage=ProcessingStage.QUEUED,
                     percent=0,
-                    message=f"Queued (position {self.size})"
+                    message=f"Queued (position {queue_size})"
                 ))
 
             return True
@@ -130,24 +143,29 @@ class QueueManager:
             while self._queue:
                 queued = heappop(self._queue)
 
-                # Skip cancelled requests
+                # Skip cancelled requests (already removed from _requests in cancel())
                 if queued.cancelled:
-                    del self._requests[queued.request.request_id]
+                    # Clean up from _requests if somehow still there (defensive)
+                    self._requests.pop(queued.request.request_id, None)
                     continue
 
                 # Check if request has expired while waiting in queue
-                wait_time = (datetime.now() - queued.queued_at).total_seconds()
+                # Use monotonic time difference for reliable timeout regardless of clock adjustments
+                wait_time = time.monotonic() - queued.queued_at
                 if wait_time > self.request_timeout:
                     logger.warning(
                         f"Request {queued.request.request_id} expired after "
                         f"{wait_time:.1f}s in queue (timeout: {self.request_timeout}s)"
                     )
-                    if queued.request.request_id in self._requests:
-                        del self._requests[queued.request.request_id]
+                    # Remove from _requests dict BEFORE returning. This is intentional:
+                    # - The request is no longer "queued" - it's being handed off for timeout handling
+                    # - Lookups (get_position, cancel) should not find it since it's already expired
+                    # - The returned object carries all state needed for the worker to notify the client
+                    self._requests.pop(queued.request.request_id, None)
                     # Mark as timed out so worker can send appropriate error
                     queued.cancelled = True
                     queued.timeout_expired = True
-                    # Still return it so worker can notify client
+                    # Return it so worker can notify client of the timeout
                     if not self._queue:
                         self._not_empty.clear()
                     return queued
@@ -189,7 +207,11 @@ class QueueManager:
         """
         async with self._lock:
             if request_id in self._requests:
-                self._requests[request_id].cancelled = True
+                queued = self._requests[request_id]
+                queued.cancelled = True
+                # Remove from _requests dict immediately to free memory
+                # The heap entry remains but will be skipped/cleaned in dequeue()
+                del self._requests[request_id]
                 logger.info(f"Cancelled request {request_id}")
                 return True
             return False

@@ -13,9 +13,11 @@ class TestProcessRequest:
 
     def test_to_json_and_back(self):
         """Test round-trip serialization."""
+        # Use valid OGG audio header for format validation
+        audio_data = b"OggS" + b"\x00" * 100
         request = ProcessRequest(
             request_id="test-123",
-            audio_data=b"fake audio data",
+            audio_data=audio_data,
             options=ProcessingOptions(
                 transcribe=True,
                 diarize=True,
@@ -41,7 +43,8 @@ class TestProcessRequest:
 
     def test_audio_data_base64_encoding(self):
         """Test that audio data is properly base64 encoded."""
-        audio = b"\x00\x01\x02\x03\xff\xfe\xfd"
+        # Use valid WAV header for format validation
+        audio = b"RIFF" + b"\x00\x01\x02\x03" + b"WAVE" + b"\xff\xfe\xfd" + b"\x00" * 50
         request = ProcessRequest(
             request_id="test",
             audio_data=audio,
