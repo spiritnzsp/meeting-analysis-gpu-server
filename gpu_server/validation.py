@@ -260,7 +260,7 @@ def detect_audio_format(audio_data: bytes) -> Optional[str]:
 
 def validate_audio_data(
     audio_data: bytes,
-    max_size: int = 100 * 1024 * 1024,
+    max_size: int = 500 * 1024 * 1024,
     require_valid_format: bool = True
 ) -> bytes:
     """

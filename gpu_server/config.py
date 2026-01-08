@@ -180,7 +180,7 @@ class ServerConfig:
     host: str = "0.0.0.0"
     port: int = 8765
     max_connections: int = 10
-    max_message_size: int = 100 * 1024 * 1024  # 100MB default
+    max_message_size: int = 500 * 1024 * 1024  # 500MB default for long recordings
     # Rate limiting for PROCESS requests (stricter)
     rate_limit_requests: int = 10  # Max PROCESS requests per window
     rate_limit_window: int = 60  # Window in seconds
