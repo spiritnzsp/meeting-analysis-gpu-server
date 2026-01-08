@@ -425,6 +425,16 @@ class GPUServer:
         data = parse_message(message)
         msg_type = data.get("type")
 
+        # Handle parsing errors (parse_message returns {"type": "error", "error": "..."} on failure)
+        if msg_type == "error" and "error" in data:
+            logger.warning(f"Message parsing error: {data.get('error')}")
+            await websocket.send(ErrorMessage(
+                request_id="",
+                error=data.get("error", "Message parsing failed"),
+                error_code="MESSAGE_PARSE_ERROR",
+            ).to_json())
+            return
+
         if msg_type == MessageType.PROCESS:
             await self._handle_process_request(websocket, data)
 

@@ -350,7 +350,8 @@ class CancelledMessage:
 
 
 # Maximum JSON message size (defense-in-depth, WebSocket also has limits)
-MAX_JSON_SIZE = 10 * 1024 * 1024  # 10MB for JSON control messages (not binary data)
+# Needs to be large enough for base64-encoded audio files (1 hour opus ~ 30MB raw, ~40MB base64)
+MAX_JSON_SIZE = 100 * 1024 * 1024  # 100MB to handle long recordings
 
 
 def parse_message(data: str, max_size: int = MAX_JSON_SIZE) -> Dict[str, Any]:
