@@ -298,6 +298,16 @@ class PyAnnoteProcessor:
                 # Get unique speakers for index mapping
                 unique_speakers = list(speaker_map.keys())
 
+                # Build a map of best segment per speaker (longest segment for quality)
+                # Segments already have normalized labels at this point
+                speaker_best_segment: Dict[str, DiarizationSegment] = {}
+                for seg in segments:
+                    duration = seg.end - seg.start
+                    if seg.speaker not in speaker_best_segment:
+                        speaker_best_segment[seg.speaker] = seg
+                    elif duration > (speaker_best_segment[seg.speaker].end - speaker_best_segment[seg.speaker].start):
+                        speaker_best_segment[seg.speaker] = seg
+
                 # Handle SlidingWindowFeature format (frame-level embeddings from return_embeddings=True)
                 if hasattr(raw_embeddings, 'data') and hasattr(raw_embeddings, 'sliding_window'):
                     # SlidingWindowFeature: compute per-speaker centroids
@@ -325,8 +335,17 @@ class PyAnnoteProcessor:
                         if speaker_frames:
                             # Compute centroid (mean of frame embeddings)
                             centroid = np.mean(speaker_frames, axis=0)
-                            self._last_embeddings[normalized_label] = [(centroid, 0.0, 0.0, 1.0)]
-                            logger.info(f"Computed centroid for {normalized_label}: dim={len(centroid)}, frames={len(speaker_frames)}")
+                            # Get timing from best segment
+                            best_seg = speaker_best_segment.get(normalized_label)
+                            if best_seg:
+                                seg_start = best_seg.start
+                                seg_duration = best_seg.end - best_seg.start
+                                quality = min(1.0, seg_duration / 10.0)
+                            else:
+                                seg_start, seg_duration, quality = 0.0, 0.0, 0.8
+                            self._last_embeddings[normalized_label] = [(centroid, seg_start, seg_duration, quality)]
+                            logger.info(f"Computed centroid for {normalized_label}: dim={len(centroid)}, "
+                                       f"frames={len(speaker_frames)}, segment={seg_start:.1f}-{seg_start+seg_duration:.1f}s")
 
                 elif isinstance(raw_embeddings, np.ndarray) and len(raw_embeddings) > 0:
                     # Embeddings are array: shape (num_speakers, embedding_dim)
@@ -336,9 +355,17 @@ class PyAnnoteProcessor:
                             if hasattr(emb_np, 'cpu'):
                                 emb_np = emb_np.cpu().numpy()
                             normalized_label = speaker_map[orig_label]
-                            # Store as (embedding, start, duration, quality) tuples
-                            self._last_embeddings[normalized_label] = [(emb_np, 0.0, 0.0, 1.0)]
-                            logger.info(f"Stored embedding for {normalized_label}: dim={len(emb_np)}")
+                            # Get timing from best segment
+                            best_seg = speaker_best_segment.get(normalized_label)
+                            if best_seg:
+                                seg_start = best_seg.start
+                                seg_duration = best_seg.end - best_seg.start
+                                quality = min(1.0, seg_duration / 10.0)
+                            else:
+                                seg_start, seg_duration, quality = 0.0, 0.0, 0.8
+                            self._last_embeddings[normalized_label] = [(emb_np, seg_start, seg_duration, quality)]
+                            logger.info(f"Stored embedding for {normalized_label}: dim={len(emb_np)}, "
+                                       f"segment={seg_start:.1f}-{seg_start+seg_duration:.1f}s")
 
                 elif hasattr(raw_embeddings, 'items'):
                     # Dict format
@@ -350,8 +377,17 @@ class PyAnnoteProcessor:
                         else:
                             emb_np = np.array(embedding)
                         normalized_label = speaker_map.get(orig_label, orig_label)
-                        self._last_embeddings[normalized_label] = [(emb_np, 0.0, 0.0, 1.0)]
-                        logger.info(f"Stored embedding for {normalized_label}: dim={len(emb_np)}")
+                        # Get timing from best segment
+                        best_seg = speaker_best_segment.get(normalized_label)
+                        if best_seg:
+                            seg_start = best_seg.start
+                            seg_duration = best_seg.end - best_seg.start
+                            quality = min(1.0, seg_duration / 10.0)
+                        else:
+                            seg_start, seg_duration, quality = 0.0, 0.0, 0.8
+                        self._last_embeddings[normalized_label] = [(emb_np, seg_start, seg_duration, quality)]
+                        logger.info(f"Stored embedding for {normalized_label}: dim={len(emb_np)}, "
+                                   f"segment={seg_start:.1f}-{seg_start+seg_duration:.1f}s")
 
                 if self._last_embeddings:
                     logger.info(f"Extracted {len(self._last_embeddings)} pre-computed embeddings")
