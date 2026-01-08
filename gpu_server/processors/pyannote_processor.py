@@ -168,6 +168,31 @@ class PyAnnoteProcessor:
         Raises:
             ProcessorCancelled: If cancel event is set
         """
+        import torchaudio
+
+        self._check_cancelled(request_id)
+
+        # Pre-load audio with torchaudio for optimal performance
+        # This is much faster than letting PyAnnote decode the file internally
+        logger.info(f"Loading audio file: {audio_path}")
+        waveform, sample_rate = torchaudio.load(str(audio_path))
+        logger.info(f"Loaded audio: shape={waveform.shape}, sample_rate={sample_rate}Hz")
+
+        # Resample to 16kHz if needed (optimal for PyAnnote)
+        target_sample_rate = 16000
+        if sample_rate != target_sample_rate:
+            logger.info(f"Resampling from {sample_rate}Hz to {target_sample_rate}Hz")
+            resampler = torchaudio.transforms.Resample(
+                orig_freq=sample_rate,
+                new_freq=target_sample_rate
+            )
+            waveform = resampler(waveform)
+            sample_rate = target_sample_rate
+            logger.info(f"Resampled audio: shape={waveform.shape}")
+
+        # Prepare audio input as waveform tensor (much faster than file path)
+        audio_input = {"waveform": waveform, "sample_rate": sample_rate}
+
         self._check_cancelled(request_id)
 
         # Run diarization
@@ -175,7 +200,8 @@ class PyAnnoteProcessor:
         if num_speakers:
             diarization_params['num_speakers'] = num_speakers
 
-        diarization = self._pipeline(str(audio_path), **diarization_params)
+        logger.info("Starting PyAnnote diarization...")
+        diarization = self._pipeline(audio_input, **diarization_params)
 
         self._check_cancelled(request_id)
 
