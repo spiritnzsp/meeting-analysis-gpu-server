@@ -58,6 +58,10 @@ class PyAnnoteProcessor:
         self._operation_complete.set()  # Initially not processing
         self._is_processing = False
 
+        # Store pre-computed embeddings from diarization (avoids loading separate model)
+        self._last_embeddings: Dict[str, List[tuple]] = {}
+        self._last_speaker_map: Dict[str, str] = {}  # SPEAKER_00 -> Person-1 mapping
+
         # Dedicated thread pool for GPU operations to avoid blocking event loop
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pyannote_gpu")
 
@@ -259,6 +263,51 @@ class PyAnnoteProcessor:
             if seg.speaker not in speaker_map:
                 speaker_map[seg.speaker] = f"Person-{len(speaker_map) + 1}"
             seg.speaker = speaker_map[seg.speaker]
+
+        # Store speaker map for embedding key conversion
+        self._last_speaker_map = speaker_map
+
+        # Extract pre-computed embeddings from DiarizeOutput (PyAnnote 3.x)
+        # This avoids needing to load a separate embedding model
+        self._last_embeddings = {}
+        try:
+            raw_embeddings = getattr(diarization_result, 'speaker_embeddings', None)
+            if raw_embeddings is not None and len(raw_embeddings) > 0:
+                logger.info(f"Found pre-computed embeddings: type={type(raw_embeddings)}, "
+                           f"shape={raw_embeddings.shape if hasattr(raw_embeddings, 'shape') else 'N/A'}")
+
+                # Get unique speakers for index mapping
+                unique_speakers = list(speaker_map.keys())
+
+                if isinstance(raw_embeddings, np.ndarray):
+                    # Embeddings are array: shape (num_speakers, embedding_dim)
+                    for idx, orig_label in enumerate(unique_speakers):
+                        if idx < len(raw_embeddings):
+                            emb_np = raw_embeddings[idx]
+                            if hasattr(emb_np, 'cpu'):
+                                emb_np = emb_np.cpu().numpy()
+                            normalized_label = speaker_map[orig_label]
+                            # Store as (embedding, start, duration, quality) tuples
+                            self._last_embeddings[normalized_label] = [(emb_np, 0.0, 0.0, 1.0)]
+                            logger.info(f"Stored embedding for {normalized_label}: dim={len(emb_np)}")
+                elif hasattr(raw_embeddings, 'items'):
+                    # Dict format
+                    for orig_label, embedding in raw_embeddings.items():
+                        if hasattr(embedding, 'cpu'):
+                            emb_np = embedding.cpu().numpy()
+                        elif hasattr(embedding, 'numpy'):
+                            emb_np = embedding.numpy()
+                        else:
+                            emb_np = np.array(embedding)
+                        normalized_label = speaker_map.get(orig_label, orig_label)
+                        self._last_embeddings[normalized_label] = [(emb_np, 0.0, 0.0, 1.0)]
+                        logger.info(f"Stored embedding for {normalized_label}: dim={len(emb_np)}")
+
+                logger.info(f"Extracted {len(self._last_embeddings)} pre-computed embeddings")
+            else:
+                logger.info("No pre-computed speaker_embeddings in diarization result")
+        except Exception as e:
+            logger.warning(f"Failed to extract pre-computed embeddings: {e}")
 
         logger.info(f"Diarization complete: {len(segments)} segments, {len(speaker_map)} speakers")
         return segments
@@ -467,6 +516,27 @@ class PyAnnoteProcessor:
         """
         if self._shutdown:
             raise RuntimeError("PyAnnoteProcessor has been shut down")
+
+        # Check for pre-computed embeddings from diarization (preferred method)
+        if self._last_embeddings:
+            logger.info(f"Using {len(self._last_embeddings)} pre-computed embeddings from diarization")
+            embeddings = []
+            for speaker_label, emb_list in self._last_embeddings.items():
+                for emb_np, start, duration, quality in emb_list:
+                    embeddings.append(SpeakerEmbedding(
+                        speaker_label=speaker_label,
+                        meeting_id=meeting_id,
+                        segment_start=start,
+                        segment_duration=duration,
+                        embedding=emb_np.tolist() if hasattr(emb_np, 'tolist') else list(emb_np),
+                        quality_score=quality,
+                    ))
+            # Clear after use to avoid stale data
+            self._last_embeddings = {}
+            return embeddings
+
+        # No pre-computed embeddings - fall back to loading separate model
+        logger.info("No pre-computed embeddings available, loading embedding model...")
 
         # Mark operation as in-progress
         self._operation_complete.clear()
