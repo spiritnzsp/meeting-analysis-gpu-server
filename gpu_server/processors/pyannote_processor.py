@@ -390,7 +390,11 @@ class PyAnnoteProcessor:
                                    f"segment={seg_start:.1f}-{seg_start+seg_duration:.1f}s")
 
                 if self._last_embeddings:
-                    logger.info(f"Extracted {len(self._last_embeddings)} pre-computed embeddings")
+                    logger.info(f"Extracted {len(self._last_embeddings)} pre-computed embeddings:")
+                    for label, emb_list in self._last_embeddings.items():
+                        if emb_list:
+                            emb_np, start, dur, qual = emb_list[0]
+                            logger.info(f"  {label}: dim={len(emb_np)}, segment={start:.1f}s-{start+dur:.1f}s, quality={qual:.2f}")
                 else:
                     logger.warning("Could not extract speaker embeddings from provided format")
             else:
