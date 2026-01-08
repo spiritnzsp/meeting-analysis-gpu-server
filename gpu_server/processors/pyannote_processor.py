@@ -223,18 +223,32 @@ class PyAnnoteProcessor:
         if num_speakers:
             diarization_params['num_speakers'] = num_speakers
 
+        # Request embeddings to be returned with diarization result
+        # This is essential for the attendee registry speaker identification feature
+        diarization_params['return_embeddings'] = True
+
         logger.info("Starting PyAnnote diarization...")
         diarization_result = self._pipeline(audio_input, **diarization_params)
 
         self._check_cancelled(request_id)
 
         # Handle different PyAnnote return types
+        # When return_embeddings=True, PyAnnote returns (Annotation/DiarizeOutput, embeddings_tensor)
+        raw_embeddings_from_result = None
+        if isinstance(diarization_result, tuple) and len(diarization_result) == 2:
+            logger.info("Received tuple result from PyAnnote (diarization, embeddings)")
+            diarization_output, raw_embeddings_from_result = diarization_result
+            logger.info(f"Embeddings tensor type: {type(raw_embeddings_from_result)}, "
+                       f"shape: {raw_embeddings_from_result.shape if hasattr(raw_embeddings_from_result, 'shape') else 'N/A'}")
+        else:
+            diarization_output = diarization_result
+
         # DiarizeOutput (PyAnnote 3.x) wraps Annotation in speaker_diarization attribute
-        if hasattr(diarization_result, 'speaker_diarization'):
-            diarization = diarization_result.speaker_diarization
+        if hasattr(diarization_output, 'speaker_diarization'):
+            diarization = diarization_output.speaker_diarization
             logger.info("Extracted Annotation from DiarizeOutput")
         else:
-            diarization = diarization_result
+            diarization = diarization_output
 
         # Convert to segments
         segments: List[DiarizationSegment] = []
@@ -267,19 +281,54 @@ class PyAnnoteProcessor:
         # Store speaker map for embedding key conversion
         self._last_speaker_map = speaker_map
 
-        # Extract pre-computed embeddings from DiarizeOutput (PyAnnote 3.x)
+        # Extract pre-computed embeddings from diarization result
         # This avoids needing to load a separate embedding model
         self._last_embeddings = {}
         try:
-            raw_embeddings = getattr(diarization_result, 'speaker_embeddings', None)
-            if raw_embeddings is not None and len(raw_embeddings) > 0:
+            # Use embeddings from tuple result (return_embeddings=True)
+            # or fall back to speaker_embeddings attribute (DiarizeOutput)
+            raw_embeddings = raw_embeddings_from_result
+            if raw_embeddings is None:
+                raw_embeddings = getattr(diarization_output, 'speaker_embeddings', None)
+
+            if raw_embeddings is not None:
                 logger.info(f"Found pre-computed embeddings: type={type(raw_embeddings)}, "
                            f"shape={raw_embeddings.shape if hasattr(raw_embeddings, 'shape') else 'N/A'}")
 
                 # Get unique speakers for index mapping
                 unique_speakers = list(speaker_map.keys())
 
-                if isinstance(raw_embeddings, np.ndarray):
+                # Handle SlidingWindowFeature format (frame-level embeddings from return_embeddings=True)
+                if hasattr(raw_embeddings, 'data') and hasattr(raw_embeddings, 'sliding_window'):
+                    # SlidingWindowFeature: compute per-speaker centroids
+                    logger.info("Processing SlidingWindowFeature embeddings...")
+                    frame_embeddings = raw_embeddings.data  # shape (num_frames, embedding_dim)
+                    sliding_window = raw_embeddings.sliding_window
+                    logger.info(f"Frame embeddings shape: {frame_embeddings.shape}, "
+                               f"num_frames: {len(frame_embeddings)}")
+
+                    # At this point, segments have normalized labels (Person-1, Person-2, etc.)
+                    # Compute speaker centroids by averaging frame embeddings within speaker segments
+                    normalized_speakers = set(seg.speaker for seg in segments)
+                    for normalized_label in normalized_speakers:
+                        speaker_frames = []
+                        for seg in segments:
+                            if seg.speaker == normalized_label:
+                                # Find frames within this segment's time range
+                                for frame_idx in range(len(frame_embeddings)):
+                                    frame_start = sliding_window[frame_idx].start
+                                    frame_end = sliding_window[frame_idx].end
+                                    frame_mid = (frame_start + frame_end) / 2
+                                    if seg.start <= frame_mid <= seg.end:
+                                        speaker_frames.append(frame_embeddings[frame_idx])
+
+                        if speaker_frames:
+                            # Compute centroid (mean of frame embeddings)
+                            centroid = np.mean(speaker_frames, axis=0)
+                            self._last_embeddings[normalized_label] = [(centroid, 0.0, 0.0, 1.0)]
+                            logger.info(f"Computed centroid for {normalized_label}: dim={len(centroid)}, frames={len(speaker_frames)}")
+
+                elif isinstance(raw_embeddings, np.ndarray) and len(raw_embeddings) > 0:
                     # Embeddings are array: shape (num_speakers, embedding_dim)
                     for idx, orig_label in enumerate(unique_speakers):
                         if idx < len(raw_embeddings):
@@ -290,6 +339,7 @@ class PyAnnoteProcessor:
                             # Store as (embedding, start, duration, quality) tuples
                             self._last_embeddings[normalized_label] = [(emb_np, 0.0, 0.0, 1.0)]
                             logger.info(f"Stored embedding for {normalized_label}: dim={len(emb_np)}")
+
                 elif hasattr(raw_embeddings, 'items'):
                     # Dict format
                     for orig_label, embedding in raw_embeddings.items():
@@ -303,7 +353,10 @@ class PyAnnoteProcessor:
                         self._last_embeddings[normalized_label] = [(emb_np, 0.0, 0.0, 1.0)]
                         logger.info(f"Stored embedding for {normalized_label}: dim={len(emb_np)}")
 
-                logger.info(f"Extracted {len(self._last_embeddings)} pre-computed embeddings")
+                if self._last_embeddings:
+                    logger.info(f"Extracted {len(self._last_embeddings)} pre-computed embeddings")
+                else:
+                    logger.warning("Could not extract speaker embeddings from provided format")
             else:
                 logger.info("No pre-computed speaker_embeddings in diarization result")
         except Exception as e:
