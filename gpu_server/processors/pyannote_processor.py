@@ -349,7 +349,13 @@ class PyAnnoteProcessor:
 
                 elif isinstance(raw_embeddings, np.ndarray) and len(raw_embeddings) > 0:
                     # Embeddings are array: shape (num_speakers, embedding_dim)
-                    for idx, orig_label in enumerate(unique_speakers):
+                    # CRITICAL: PyAnnote orders embeddings alphabetically (SPEAKER_00, SPEAKER_01, ...)
+                    # but unique_speakers is in first-appearance order. We must sort to match.
+                    unique_speakers_sorted = sorted(unique_speakers)
+                    logger.info(f"Speaker label mapping: first-appearance={unique_speakers}, "
+                               f"sorted (PyAnnote order)={unique_speakers_sorted}")
+
+                    for idx, orig_label in enumerate(unique_speakers_sorted):
                         if idx < len(raw_embeddings):
                             emb_np = raw_embeddings[idx]
                             if hasattr(emb_np, 'cpu'):
@@ -364,7 +370,7 @@ class PyAnnoteProcessor:
                             else:
                                 seg_start, seg_duration, quality = 0.0, 0.0, 0.8
                             self._last_embeddings[normalized_label] = [(emb_np, seg_start, seg_duration, quality)]
-                            logger.info(f"Stored embedding for {normalized_label}: dim={len(emb_np)}, "
+                            logger.info(f"Stored embedding for {normalized_label} (from {orig_label}): dim={len(emb_np)}, "
                                        f"segment={seg_start:.1f}-{seg_start+seg_duration:.1f}s")
 
                 elif hasattr(raw_embeddings, 'items'):
