@@ -69,8 +69,12 @@ class PyAnnoteProcessor:
         try:
             # PyTorch 2.6+ compatibility for pyannote model loading
             import torch
-            from torch.version import TorchVersion
-            torch.serialization.add_safe_globals([TorchVersion])
+            try:
+                from torch.version import TorchVersion
+                torch.serialization.add_safe_globals([TorchVersion])
+            except ImportError:
+                # TorchVersion was removed in PyTorch 2.6+
+                pass
 
             # Additional pyannote classes that need whitelisting
             try:
@@ -85,10 +89,18 @@ class PyAnnoteProcessor:
 
             logger.info(f"Loading PyAnnote pipeline: {self.config.model}")
 
-            self._pipeline = Pipeline.from_pretrained(
-                self.config.model,
-                use_auth_token=self.config.huggingface_token,
-            )
+            # Try new API (token) first, fall back to old API (use_auth_token)
+            try:
+                self._pipeline = Pipeline.from_pretrained(
+                    self.config.model,
+                    token=self.config.huggingface_token,
+                )
+            except TypeError:
+                # Older pyannote versions use use_auth_token
+                self._pipeline = Pipeline.from_pretrained(
+                    self.config.model,
+                    use_auth_token=self.config.huggingface_token,
+                )
 
             # Support both "cuda" and "cuda:N" device specifications
             if self.config.device.startswith("cuda"):

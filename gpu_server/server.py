@@ -438,6 +438,12 @@ class GPUServer:
                 "is_processing": self.worker.is_processing,
             }))
 
+        elif msg_type == "auth":
+            # Client sent auth message but already authenticated - ignore silently
+            # This happens when auth is disabled (auto-auth on connect) but client
+            # still sends auth message
+            logger.debug("Ignoring auth message from already-authenticated client")
+
         else:
             logger.warning(f"Unknown message type: {msg_type}")
             await websocket.send(ErrorMessage(
