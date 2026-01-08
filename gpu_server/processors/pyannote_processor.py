@@ -118,8 +118,13 @@ class PyAnnoteProcessor:
             logger.error(f"Failed to load PyAnnote pipeline: {e}")
             raise
 
-    def _ensure_embedding_model_sync(self):
-        """Load the embedding model if not already loaded (synchronous, runs in executor)."""
+    def _ensure_embedding_model_sync(self, client_hf_token: Optional[str] = None):
+        """Load the embedding model if not already loaded (synchronous, runs in executor).
+
+        Args:
+            client_hf_token: Optional token from client (used if model not cached).
+                             Once model is downloaded, token is no longer needed.
+        """
         if self._embedding_model is not None:
             return
 
@@ -128,10 +133,24 @@ class PyAnnoteProcessor:
 
             logger.info("Loading PyAnnote embedding model")
 
-            self._embedding_model = Model.from_pretrained(
-                "pyannote/embedding",
-                use_auth_token=self.config.huggingface_token,
-            )
+            # Use client's token if provided, otherwise fall back to server config
+            # Client token is especially useful for first-time model download
+            token = client_hf_token or self.config.huggingface_token
+            if client_hf_token:
+                logger.info("Using client-provided HuggingFace token for embedding model")
+
+            # Try new API (token) first, fall back to old API (use_auth_token)
+            try:
+                self._embedding_model = Model.from_pretrained(
+                    "pyannote/embedding",
+                    token=token,
+                )
+            except TypeError:
+                # Older pyannote versions use use_auth_token
+                self._embedding_model = Model.from_pretrained(
+                    "pyannote/embedding",
+                    use_auth_token=token,
+                )
 
             # Support both "cuda" and "cuda:N" device specifications
             if self.config.device.startswith("cuda"):
@@ -201,18 +220,38 @@ class PyAnnoteProcessor:
             diarization_params['num_speakers'] = num_speakers
 
         logger.info("Starting PyAnnote diarization...")
-        diarization = self._pipeline(audio_input, **diarization_params)
+        diarization_result = self._pipeline(audio_input, **diarization_params)
 
         self._check_cancelled(request_id)
 
+        # Handle different PyAnnote return types
+        # DiarizeOutput (PyAnnote 3.x) wraps Annotation in speaker_diarization attribute
+        if hasattr(diarization_result, 'speaker_diarization'):
+            diarization = diarization_result.speaker_diarization
+            logger.info("Extracted Annotation from DiarizeOutput")
+        else:
+            diarization = diarization_result
+
         # Convert to segments
         segments: List[DiarizationSegment] = []
-        for turn, _, speaker in diarization.itertracks(yield_label=True):
-            segments.append(DiarizationSegment(
-                start=turn.start,
-                end=turn.end,
-                speaker=speaker,
-            ))
+        if hasattr(diarization, 'itertracks'):
+            # Standard Annotation object
+            for turn, _, speaker in diarization.itertracks(yield_label=True):
+                segments.append(DiarizationSegment(
+                    start=turn.start,
+                    end=turn.end,
+                    speaker=speaker,
+                ))
+        elif hasattr(diarization, 'items'):
+            # Dict-like object fallback
+            for (segment, track), speaker in diarization.items():
+                segments.append(DiarizationSegment(
+                    start=segment.start,
+                    end=segment.end,
+                    speaker=speaker,
+                ))
+        else:
+            raise AttributeError(f"Cannot iterate diarization result of type {type(diarization)}")
 
         # Normalize speaker labels (SPEAKER_00 -> Person-1)
         speaker_map = {}
@@ -406,6 +445,7 @@ class PyAnnoteProcessor:
         meeting_id: str = "",
         progress_callback: Optional[Callable[[ProgressMessage], Awaitable[None]]] = None,
         request_id: str = "",
+        hf_token: Optional[str] = None,
     ) -> List[SpeakerEmbedding]:
         """
         Extract speaker embeddings from audio (non-blocking).
@@ -416,6 +456,7 @@ class PyAnnoteProcessor:
             meeting_id: Meeting ID for embedding metadata
             progress_callback: Callback for progress updates
             request_id: Request ID for progress messages
+            hf_token: Optional client HuggingFace token (for first-time model download)
 
         Returns:
             List of SpeakerEmbedding (one per unique speaker)
@@ -442,9 +483,11 @@ class PyAnnoteProcessor:
 
         try:
             # Load embedding model in executor (blocking operation)
+            # Pass client token for first-time model download
+            from functools import partial
             await loop.run_in_executor(
                 self._executor,
-                self._ensure_embedding_model_sync,
+                partial(self._ensure_embedding_model_sync, client_hf_token=hf_token),
             )
 
             # Write audio to temp file with robust cleanup

@@ -337,26 +337,34 @@ class GPUWorker:
                         transcript_segments, diarization_segments
                     )
 
-            # Extract embeddings
+            # Extract embeddings (non-fatal - attendee registry is optional)
             if request.options.extract_embeddings and diarization_segments:
                 logger.info(LogEvents.EMBEDDING_EXTRACTION_STARTED)
                 embed_start = time.time()
 
-                speaker_embeddings = await self._pyannote.extract_embeddings(
-                    audio_data=request.audio_data,
-                    diarization_segments=diarization_segments,
-                    meeting_id=request.request_id,
-                    progress_callback=send_progress,
-                    request_id=request.request_id,
-                )
+                try:
+                    speaker_embeddings = await self._pyannote.extract_embeddings(
+                        audio_data=request.audio_data,
+                        diarization_segments=diarization_segments,
+                        meeting_id=request.request_id,
+                        progress_callback=send_progress,
+                        request_id=request.request_id,
+                        hf_token=request.options.hf_token,
+                    )
 
-                logger.info(
-                    LogEvents.EMBEDDING_EXTRACTION_COMPLETED,
-                    data={
-                        'duration_ms': (time.time() - embed_start) * 1000,
-                        'embeddings': len(speaker_embeddings),
-                    }
-                )
+                    logger.info(
+                        LogEvents.EMBEDDING_EXTRACTION_COMPLETED,
+                        data={
+                            'duration_ms': (time.time() - embed_start) * 1000,
+                            'embeddings': len(speaker_embeddings),
+                        }
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Embedding extraction failed (non-fatal): {e}",
+                        exc_info=False,
+                    )
+                    speaker_embeddings = []
 
             # Build result
             processing_time = time.time() - start_time

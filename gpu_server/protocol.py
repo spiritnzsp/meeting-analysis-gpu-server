@@ -110,6 +110,7 @@ class ProcessingOptions:
     whisper_model: Optional[str] = None  # Override server default
     language: Optional[str] = None  # Force language (null = auto)
     num_speakers: Optional[int] = None  # Hint for diarization
+    hf_token: Optional[str] = None  # Client's HuggingFace token for PyAnnote
 
 
 @dataclass
@@ -205,6 +206,7 @@ class ProcessRequest:
             whisper_model=validate_whisper_model(options_dict.get("whisper_model")),
             language=validate_language(options_dict.get("language")),
             num_speakers=validate_num_speakers(options_dict.get("num_speakers")),
+            hf_token=options_dict.get("hf_token"),  # Client's HuggingFace token
         )
 
         return cls(
