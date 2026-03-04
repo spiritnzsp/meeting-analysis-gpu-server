@@ -21,11 +21,14 @@ from .logging_config import (
 from .protocol import (
     MessageType, parse_message, ProcessRequest, AuthMessage,
     ProgressMessage, ProcessingStage, ErrorMessage, AuthErrorMessage,
-    CancelledMessage, PROTOCOL_VERSION_STRING, is_version_compatible
+    CancelledMessage, PROTOCOL_VERSION_STRING, is_version_compatible,
+    VideoEncodeRequest,
 )
+from .binary_protocol import BinaryFrameType, decode_binary_frame
 from .queue_manager import QueueManager
 from .validation import ValidationError
 from .worker import GPUWorker
+from .video_worker import VideoWorker
 
 logger = get_logger(__name__)
 
@@ -109,9 +112,10 @@ class GPUServer:
 
     Handles:
     - Client authentication
-    - Request queuing
+    - Request queuing (audio + video)
     - Progress streaming
     - Result delivery
+    - Binary frame dispatch for video data
     """
 
     def __init__(self, config: Config):
@@ -122,11 +126,25 @@ class GPUServer:
             config: Server configuration
         """
         self.config = config
+
+        # Audio queue and worker
         self.queue = QueueManager(
             max_size=config.queue.max_size,
             request_timeout=config.queue.request_timeout,
+            queue_name="audio",
         )
         self.worker = GPUWorker(config, self.queue)
+
+        # Video queue and worker (created if enabled)
+        self.video_queue: Optional[QueueManager] = None
+        self.video_worker: Optional[VideoWorker] = None
+        if config.video_encoding.enabled:
+            self.video_queue = QueueManager(
+                max_size=config.video_queue.max_size,
+                request_timeout=config.video_queue.request_timeout,
+                queue_name="video",
+            )
+            self.video_worker = VideoWorker(config, self.video_queue)
 
         self._authenticated_clients: Set[WebSocketServerProtocol] = set()
         self._pending_connections: Set[WebSocketServerProtocol] = set()  # Pre-auth connections
@@ -135,6 +153,7 @@ class GPUServer:
         self._message_limiters: Dict[WebSocketServerProtocol, MessageRateLimiter] = {}
         self._server = None
         self._worker_task = None
+        self._video_worker_task = None
 
     async def start(self):
         """Start the server."""
@@ -145,14 +164,19 @@ class GPUServer:
                 'port': self.config.server.port,
                 'max_connections': self.config.server.max_connections,
                 'queue_max_size': self.config.queue.max_size,
+                'video_encoding_enabled': self.config.video_encoding.enabled,
             }
         )
 
         # Create SSL context if TLS is enabled
         ssl_context = create_ssl_context(self.config.tls)
 
-        # Start the worker
+        # Start the audio worker
         self._worker_task = asyncio.create_task(self.worker.start())
+
+        # Start the video worker if enabled
+        if self.video_worker:
+            self._video_worker_task = asyncio.create_task(self.video_worker.start())
 
         # Start WebSocket server
         self._server = await websockets.serve(
@@ -177,6 +201,7 @@ class GPUServer:
                 'max_message_size_mb': max_mb,
                 'tls_enabled': ssl_context is not None,
                 'auth_enabled': self.config.auth.enabled,
+                'video_encoding_enabled': self.config.video_encoding.enabled,
             }
         )
 
@@ -189,12 +214,22 @@ class GPUServer:
             self._server.close()
             await self._server.wait_closed()
 
-        # Stop the worker
+        # Stop the audio worker
         await self.worker.stop()
         if self._worker_task:
             self._worker_task.cancel()
             try:
                 await self._worker_task
+            except asyncio.CancelledError:
+                pass
+
+        # Stop the video worker
+        if self.video_worker:
+            await self.video_worker.stop()
+        if self._video_worker_task:
+            self._video_worker_task.cancel()
+            try:
+                await self._video_worker_task
             except asyncio.CancelledError:
                 pass
 
@@ -269,9 +304,12 @@ class GPUServer:
             self._rate_limiters[websocket] = RateLimitTracker()
             self._message_limiters[websocket] = MessageRateLimiter()
 
-            # Handle messages
+            # Handle messages - support both text and binary frames
             async for message in websocket:
-                await self._handle_message(websocket, message)
+                if isinstance(message, bytes):
+                    await self._handle_binary_frame(websocket, message)
+                else:
+                    await self._handle_message(websocket, message)
 
         except websockets.exceptions.ConnectionClosed as e:
             logger.info(
@@ -305,6 +343,7 @@ class GPUServer:
                 "type": MessageType.AUTH_OK,
                 "server_version": __version__,
                 "protocol_version": PROTOCOL_VERSION_STRING,
+                "video_encoding_enabled": self.config.video_encoding.enabled,
             }))
             logger.info(LogEvents.CLIENT_AUTHENTICATED, data={'auth_disabled': True})
             return True
@@ -367,6 +406,7 @@ class GPUServer:
                 "server_version": __version__,
                 "protocol_version": PROTOCOL_VERSION_STRING,
                 "queue_size": self.queue.size,
+                "video_encoding_enabled": self.config.video_encoding.enabled,
             }))
 
             logger.info(
@@ -392,7 +432,7 @@ class GPUServer:
 
     async def _handle_message(self, websocket: WebSocketServerProtocol, message: str):
         """
-        Handle an incoming message from an authenticated client.
+        Handle an incoming text message from an authenticated client.
 
         Args:
             websocket: The WebSocket connection
@@ -438,15 +478,21 @@ class GPUServer:
         if msg_type == MessageType.PROCESS:
             await self._handle_process_request(websocket, data)
 
+        elif msg_type == MessageType.VIDEO_ENCODE:
+            await self._handle_video_encode_request(websocket, data)
+
         elif msg_type == MessageType.CANCEL:
             await self._handle_cancel(websocket, data)
 
         elif msg_type == MessageType.PING:
-            await websocket.send(json.dumps({
+            pong_data = {
                 "type": MessageType.PONG,
                 "queue_size": self.queue.size,
                 "is_processing": self.worker.is_processing,
-            }))
+            }
+            if self.video_queue:
+                pong_data["video_queue_size"] = self.video_queue.size
+            await websocket.send(json.dumps(pong_data))
 
         elif msg_type == "auth":
             # Client sent auth message but already authenticated - ignore silently
@@ -460,6 +506,56 @@ class GPUServer:
                 request_id=data.get("request_id", ""),
                 error=f"Unknown message type: {msg_type}",
                 error_code="UNKNOWN_MESSAGE_TYPE",
+            ).to_json())
+
+    async def _handle_binary_frame(self, websocket: WebSocketServerProtocol, data: bytes):
+        """
+        Handle an incoming binary WebSocket frame.
+
+        Binary frames bypass the message rate limiter since video data
+        can arrive as many frames.
+        """
+        try:
+            header, payload = decode_binary_frame(data)
+        except ValueError as e:
+            logger.warning(f"Invalid binary frame: {e}")
+            return
+
+        if header.frame_type == BinaryFrameType.VIDEO_INPUT:
+            await self._handle_video_data(websocket, header.request_id, payload)
+        else:
+            logger.warning(f"Unexpected binary frame type: {header.frame_type}")
+
+    async def _handle_video_data(self, websocket: WebSocketServerProtocol, request_id: str, payload: bytes):
+        """Handle incoming video data chunk."""
+        if not self.config.video_encoding.enabled or not self.video_worker:
+            await websocket.send(ErrorMessage(
+                request_id=request_id,
+                error="Video encoding is not enabled on this server",
+                error_code="VIDEO_ENCODING_DISABLED",
+            ).to_json())
+            return
+
+        try:
+            if len(payload) == 0:
+                # Empty payload = final frame, finalize upload
+                await self.video_worker.finalize_upload(request_id)
+            else:
+                self.video_worker.receive_video_data(request_id, payload)
+        except KeyError:
+            logger.warning(f"Video data for unknown request: {request_id}")
+            await websocket.send(ErrorMessage(
+                request_id=request_id,
+                error="No pending video upload for this request",
+                error_code="NO_PENDING_UPLOAD",
+            ).to_json())
+        except ValueError as e:
+            logger.warning(f"Video data error: {e}")
+            await websocket.send(ErrorMessage(
+                request_id=request_id,
+                error=str(e),
+                recoverable=False,
+                error_code="VIDEO_DATA_ERROR",
             ).to_json())
 
     async def _handle_process_request(self, websocket: WebSocketServerProtocol, data: dict):
@@ -567,6 +663,107 @@ class GPUServer:
                 error_code="INTERNAL_ERROR",
             ).to_json())
 
+    async def _handle_video_encode_request(self, websocket: WebSocketServerProtocol, data: dict):
+        """Handle a video encoding request."""
+        request_id = data.get("request_id", "unknown")
+
+        # Check if video encoding is enabled
+        if not self.config.video_encoding.enabled or not self.video_worker or not self.video_queue:
+            await websocket.send(ErrorMessage(
+                request_id=request_id,
+                error="Video encoding is not enabled on this server",
+                error_code="VIDEO_ENCODING_DISABLED",
+            ).to_json())
+            return
+
+        try:
+            request = VideoEncodeRequest.from_dict(data)
+            request_id = request.request_id
+
+            set_request_context(request_id=request_id)
+
+            # Validate input size against config limit
+            if request.input_size > self.config.video_encoding.max_input_size:
+                await websocket.send(ErrorMessage(
+                    request_id=request_id,
+                    error=f"Input size exceeds maximum "
+                          f"({request.input_size / 1024 / 1024:.0f} MB > "
+                          f"{self.config.video_encoding.max_input_size / 1024 / 1024:.0f} MB)",
+                    recoverable=False,
+                    error_code="INPUT_TOO_LARGE",
+                ).to_json())
+                return
+
+            # Check rate limit (shared with audio)
+            rate_limiter = self._rate_limiters.get(websocket)
+            if rate_limiter:
+                request_count = rate_limiter.get_request_count(self.config.server.rate_limit_window)
+                if request_count >= self.config.server.rate_limit_requests:
+                    await websocket.send(ErrorMessage(
+                        request_id=request_id,
+                        error="Rate limit exceeded",
+                        recoverable=True,
+                        error_code="RATE_LIMIT_EXCEEDED",
+                    ).to_json())
+                    return
+                rate_limiter.record_request()
+
+            logger.info(
+                "Video encode request received",
+                data={
+                    'filename': request.filename,
+                    'input_size': request.input_size,
+                    'priority': request.priority,
+                }
+            )
+
+            # Register upload (creates temp file)
+            self.video_worker.register_upload(request_id)
+
+            # Enqueue placeholder with pending_data=True
+            success = await self.video_queue.enqueue(
+                request, websocket, pending_data=True,
+            )
+
+            if success:
+                await websocket.send(json.dumps({
+                    "type": MessageType.QUEUED,
+                    "request_id": request_id,
+                    "position": self.video_queue.size,
+                }))
+
+                # Send progress: waiting for data
+                await websocket.send(ProgressMessage(
+                    request_id=request_id,
+                    stage=ProcessingStage.RECEIVING_VIDEO,
+                    percent=0,
+                    message="Ready to receive video data",
+                ).to_json())
+            else:
+                logger.warning("Video queue full")
+                self.video_worker._cleanup_upload(request_id)
+                await websocket.send(ErrorMessage(
+                    request_id=request_id,
+                    error="Video queue is full, please try again later",
+                    recoverable=True,
+                    error_code="QUEUE_FULL",
+                ).to_json())
+
+        except ValidationError as e:
+            await websocket.send(ErrorMessage(
+                request_id=request_id,
+                error=str(e),
+                recoverable=False,
+                error_code="VALIDATION_ERROR",
+            ).to_json())
+        except Exception as e:
+            logger.error(f"Video encode request error: {e}", exc_info=True)
+            await websocket.send(ErrorMessage(
+                request_id=request_id,
+                error="Internal server error",
+                error_code="INTERNAL_ERROR",
+            ).to_json())
+
     async def _handle_cancel(self, websocket: WebSocketServerProtocol, data: dict):
         """Handle a cancel request."""
         request_id = data.get("request_id", "")
@@ -574,7 +771,13 @@ class GPUServer:
             return
 
         set_request_context(request_id=request_id)
+
+        # Try audio queue first, then video queue
         success = await self.queue.cancel(request_id)
+        if not success and self.video_queue:
+            success = await self.video_queue.cancel(request_id)
+            if success and self.video_worker:
+                self.video_worker._cleanup_upload(request_id)
 
         if success:
             await websocket.send(CancelledMessage(request_id=request_id).to_json())
@@ -597,7 +800,7 @@ class GPUServer:
 
     def get_stats(self) -> dict:
         """Get server statistics."""
-        return {
+        stats = {
             "connected_clients": self.connected_clients,
             "queue": self.queue.get_stats(),
             "worker": {
@@ -605,3 +808,11 @@ class GPUServer:
                 "current_request": self.worker.current_request_id,
             },
         }
+        if self.video_queue and self.video_worker:
+            stats["video_queue"] = self.video_queue.get_stats()
+            stats["video_worker"] = {
+                "is_processing": self.video_worker.is_processing,
+                "current_request": self.video_worker.current_request_id,
+                "pending_uploads": self.video_worker.pending_upload_count,
+            }
+        return stats

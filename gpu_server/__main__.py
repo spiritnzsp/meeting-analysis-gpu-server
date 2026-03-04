@@ -134,6 +134,13 @@ async def main():
         logger.info(f"Auth enabled: {config.auth.enabled}")
         logger.info(f"Whisper model: {config.whisper.model}")
         logger.info(f"PyAnnote model: {config.pyannote.model}")
+        if config.video_encoding.enabled:
+            logger.info(f"Video encoding: ENABLED")
+            logger.info(f"  FFmpeg: {config.video_encoding.ffmpeg_path}")
+            logger.info(f"  Preferred codecs: {', '.join(config.video_encoding.preferred_codecs)}")
+            logger.info(f"  Max input size: {config.video_encoding.max_input_size / 1024 / 1024:.0f} MB")
+        else:
+            logger.info(f"Video encoding: disabled")
         logger.info("-" * 60)
 
         # Wait for shutdown signal

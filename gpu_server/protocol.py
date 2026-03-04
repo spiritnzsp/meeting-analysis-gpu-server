@@ -75,6 +75,7 @@ class MessageType(str, Enum):
     PROCESS = "process"
     CANCEL = "cancel"
     PING = "ping"
+    VIDEO_ENCODE = "video_encode"
 
     # Server -> Client
     AUTH_OK = "auth_ok"
@@ -85,6 +86,7 @@ class MessageType(str, Enum):
     ERROR = "error"
     PONG = "pong"
     CANCELLED = "cancelled"
+    VIDEO_RESULT = "video_result"
 
 
 class ProcessingStage(str, Enum):
@@ -99,6 +101,10 @@ class ProcessingStage(str, Enum):
     COMPLETE = "complete"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    # Video encoding stages
+    RECEIVING_VIDEO = "receiving_video"
+    PROBING_INPUT = "probing_input"
+    ENCODING = "encoding"
 
 
 @dataclass
@@ -346,6 +352,92 @@ class CancelledMessage:
         return json.dumps({
             "type": MessageType.CANCELLED,
             "request_id": self.request_id,
+        })
+
+
+@dataclass
+class VideoCodecOptions:
+    """Video encoding options."""
+    codec: Optional[str] = None          # e.g. "h264_nvenc", None = auto-select
+    preset: Optional[str] = None         # p1-p7, None = use config default
+    quality: Optional[int] = None        # CQ value 0-51, None = use config default
+    resolution: Optional[str] = None     # e.g. "1920x1080", None = keep original
+    framerate: Optional[int] = None      # e.g. 30, None = keep original
+    bitrate: Optional[str] = None        # e.g. "5M", None = use CQ mode
+    pixel_format: Optional[str] = None   # e.g. "yuv420p", None = auto
+
+
+@dataclass
+class VideoEncodeRequest:
+    """Video encoding request from client."""
+    request_id: str
+    filename: str
+    input_size: int  # Expected size in bytes
+    options: VideoCodecOptions = field(default_factory=VideoCodecOptions)
+    priority: int = 0
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> 'VideoEncodeRequest':
+        """
+        Deserialize a VideoEncodeRequest from a dictionary.
+
+        Raises:
+            ValidationError: If any field fails validation
+        """
+        request_id = validate_request_id(data.get("request_id", ""))
+
+        filename = data.get("filename", "")
+        if not filename or not isinstance(filename, str):
+            raise ValidationError("filename", "Filename is required")
+        # Basic filename sanitization - strip path separators
+        filename = filename.replace("/", "_").replace("\\", "_")
+
+        input_size = data.get("input_size", 0)
+        if not isinstance(input_size, int) or input_size <= 0:
+            raise ValidationError("input_size", "Input size must be a positive integer")
+
+        priority = validate_priority(data.get("priority", 0))
+
+        # Parse codec options
+        opts = data.get("options", {})
+        options = VideoCodecOptions(
+            codec=opts.get("codec"),
+            preset=opts.get("preset"),
+            quality=opts.get("quality"),
+            resolution=opts.get("resolution"),
+            framerate=opts.get("framerate"),
+            bitrate=opts.get("bitrate"),
+            pixel_format=opts.get("pixel_format"),
+        )
+
+        return cls(
+            request_id=request_id,
+            filename=filename,
+            input_size=input_size,
+            options=options,
+            priority=priority,
+        )
+
+
+@dataclass
+class VideoEncodeResult:
+    """Video encoding result from server."""
+    request_id: str
+    success: bool
+    output_size: int = 0
+    codec_used: str = ""
+    encoding_time: float = 0.0
+    error_message: str = ""
+
+    def to_json(self) -> str:
+        return json.dumps({
+            "type": MessageType.VIDEO_RESULT,
+            "request_id": self.request_id,
+            "success": self.success,
+            "output_size": self.output_size,
+            "codec_used": self.codec_used,
+            "encoding_time": self.encoding_time,
+            "error_message": self.error_message,
         })
 
 

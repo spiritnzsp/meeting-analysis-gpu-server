@@ -5,8 +5,6 @@ GPU-accelerated speaker diarization and embedding extraction.
 """
 import asyncio
 import math
-import threading
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional, List, Dict, Callable, Awaitable, Tuple
 
@@ -17,7 +15,7 @@ from ..protocol import (
     DiarizationSegment, SpeakerEmbedding, TranscriptSegment,
     ProgressMessage, ProcessingStage
 )
-from ..logging_config import get_logger, LogEvents
+from ..logging_config import get_logger
 from ..utils.temp_file import TempAudioFile
 
 logger = get_logger(__name__)
@@ -25,9 +23,10 @@ logger = get_logger(__name__)
 
 # Import from package __init__.py - defined there to avoid duplication
 from . import ProcessorCancelled
+from .base_processor import BaseProcessor
 
 
-class PyAnnoteProcessor:
+class PyAnnoteProcessor(BaseProcessor):
     """
     PyAnnote speaker diarization processor.
 
@@ -44,26 +43,43 @@ class PyAnnoteProcessor:
         Args:
             config: PyAnnote configuration
         """
+        super().__init__(thread_name_prefix="pyannote_gpu")
         self.config = config
         self._pipeline = None
         self._embedding_model = None
-        self._shutdown = False
-
-        # Cancellation tracking - use request_id to avoid TOCTOU race
-        self._cancelled_request_id: Optional[str] = None
-        self._cancel_lock = threading.Lock()
-
-        # Operation tracking for safe timeout handling
-        self._operation_complete = asyncio.Event()
-        self._operation_complete.set()  # Initially not processing
-        self._is_processing = False
 
         # Store pre-computed embeddings from diarization (avoids loading separate model)
         self._last_embeddings: Dict[str, List[tuple]] = {}
         self._last_speaker_map: Dict[str, str] = {}  # SPEAKER_00 -> Person-1 mapping
 
-        # Dedicated thread pool for GPU operations to avoid blocking event loop
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pyannote_gpu")
+    @property
+    def processor_name(self) -> str:
+        return "PyAnnote"
+
+    def _unload_resources(self) -> None:
+        """Unload models to free GPU memory."""
+        if self._pipeline is not None:
+            del self._pipeline
+            self._pipeline = None
+            logger.info("PyAnnote pipeline unloaded")
+
+        if self._embedding_model is not None:
+            del self._embedding_model
+            self._embedding_model = None
+            logger.info("PyAnnote embedding model unloaded")
+
+        # Force GPU memory cleanup
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except ImportError:
+            pass
+
+    # Keep unload() as a public alias for backward compatibility
+    def unload(self):
+        """Unload models to free GPU memory."""
+        self._unload_resources()
 
     def _ensure_pipeline_sync(self):
         """Load the diarization pipeline if not already loaded (synchronous, runs in executor)."""
@@ -169,12 +185,6 @@ class PyAnnoteProcessor:
         except Exception as e:
             logger.error(f"Failed to load embedding model: {e}")
             raise
-
-    def _check_cancelled(self, request_id: str) -> None:
-        """Check if processing was cancelled and raise if so."""
-        with self._cancel_lock:
-            if self._cancelled_request_id == request_id or self._cancelled_request_id == "__ANY__":
-                raise ProcessorCancelled("Processing cancelled")
 
     def _diarize_sync(
         self,
@@ -434,16 +444,8 @@ class PyAnnoteProcessor:
             RuntimeError: If processor has been shut down
             ProcessorCancelled: If processing was cancelled
         """
-        if self._shutdown:
-            raise RuntimeError("PyAnnoteProcessor has been shut down")
-
-        # Mark operation as in-progress
-        self._operation_complete.clear()
-        self._is_processing = True
-
-        # Clear any stale cancellation from previous request
-        with self._cancel_lock:
-            self._cancelled_request_id = None
+        self._check_shutdown()
+        self._begin_operation()
 
         loop = asyncio.get_running_loop()
 
@@ -493,9 +495,7 @@ class PyAnnoteProcessor:
                     logger.warning(f"Diarization async cancelled for request {request_id}")
                     raise
         finally:
-            # Mark operation as complete
-            self._is_processing = False
-            self._operation_complete.set()
+            self._end_operation()
 
     def _extract_embeddings_sync(
         self,
@@ -613,8 +613,7 @@ class PyAnnoteProcessor:
             RuntimeError: If processor has been shut down
             ProcessorCancelled: If processing was cancelled
         """
-        if self._shutdown:
-            raise RuntimeError("PyAnnoteProcessor has been shut down")
+        self._check_shutdown()
 
         # Check for pre-computed embeddings from diarization (preferred method)
         if self._last_embeddings:
@@ -637,16 +636,7 @@ class PyAnnoteProcessor:
         # No pre-computed embeddings - fall back to loading separate model
         logger.info("No pre-computed embeddings available, loading embedding model...")
 
-        # Mark operation as in-progress
-        self._operation_complete.clear()
-        self._is_processing = True
-
-        # Clear any stale cancellation from previous requests
-        # This is safe because if cancel was called during diarize(), it would have
-        # already raised ProcessorCancelled there and we wouldn't reach this point.
-        # Any remaining cancellation is from a PREVIOUS request and should be cleared.
-        with self._cancel_lock:
-            self._cancelled_request_id = None
+        self._begin_operation()
 
         loop = asyncio.get_running_loop()
 
@@ -697,9 +687,7 @@ class PyAnnoteProcessor:
                     logger.warning(f"Embedding extraction async cancelled for request {request_id}")
                     raise
         finally:
-            # Mark operation as complete
-            self._is_processing = False
-            self._operation_complete.set()
+            self._end_operation()
 
     def _is_valid_timestamp(self, start: float, end: float) -> bool:
         """Check if timestamps are valid (not NaN, not negative, end >= start)."""
@@ -758,111 +746,3 @@ class PyAnnoteProcessor:
             ts.speaker = best_speaker
 
         return transcript_segments
-
-    def cancel(self, request_id: str = "") -> None:
-        """
-        Cancel processing for a specific request.
-
-        Args:
-            request_id: The request ID to cancel. If empty, cancels any in-progress request.
-        """
-        with self._cancel_lock:
-            if request_id:
-                self._cancelled_request_id = request_id
-            elif self._is_processing:
-                # Cancel whatever is currently processing
-                self._cancelled_request_id = "__ANY__"
-        logger.info(f"PyAnnote processor cancellation requested for {request_id or 'current request'}")
-
-    async def wait_for_idle(self, timeout: float = 30.0) -> bool:
-        """
-        Wait for the processor to become idle.
-
-        Use this after cancelling to ensure GPU operations have completed
-        before starting a new request.
-
-        Args:
-            timeout: Maximum time to wait in seconds
-
-        Returns:
-            True if processor is idle, False if timeout occurred
-        """
-        if not self._is_processing:
-            return True
-
-        try:
-            await asyncio.wait_for(self._operation_complete.wait(), timeout=timeout)
-            return True
-        except asyncio.TimeoutError:
-            logger.warning(f"Timeout waiting for PyAnnote processor to become idle")
-            return False
-
-    @property
-    def is_processing(self) -> bool:
-        """Check if processor is currently running a GPU operation."""
-        return self._is_processing
-
-    def unload(self):
-        """Unload models to free GPU memory."""
-        if self._pipeline is not None:
-            del self._pipeline
-            self._pipeline = None
-            logger.info("PyAnnote pipeline unloaded")
-
-        if self._embedding_model is not None:
-            del self._embedding_model
-            self._embedding_model = None
-            logger.info("PyAnnote embedding model unloaded")
-
-        # Force GPU memory cleanup
-        try:
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except ImportError:
-            pass
-
-    def shutdown(self, timeout: float = 30.0):
-        """
-        Shutdown the processor and release all resources. Safe to call multiple times.
-
-        Args:
-            timeout: Maximum time to wait for executor shutdown (default 30s)
-        """
-        if self._shutdown:
-            return  # Already shut down
-
-        self._shutdown = True
-
-        # Signal cancellation to any running operations
-        self.cancel()
-
-        self.unload()
-
-        # Shutdown the executor with timeout
-        if self._executor is not None:
-            logger.info("Shutting down PyAnnote executor...")
-
-            # Use a thread to implement timeout since ThreadPoolExecutor.shutdown() doesn't have one
-            shutdown_complete = threading.Event()
-
-            def do_shutdown():
-                try:
-                    self._executor.shutdown(wait=True, cancel_futures=False)
-                finally:
-                    shutdown_complete.set()
-
-            shutdown_thread = threading.Thread(target=do_shutdown, daemon=True)
-            shutdown_thread.start()
-
-            if shutdown_complete.wait(timeout=timeout):
-                logger.info("PyAnnote executor shutdown complete")
-            else:
-                logger.warning(
-                    f"PyAnnote executor shutdown timed out after {timeout}s, "
-                    "forcing shutdown (operations may still be running)"
-                )
-                # Force shutdown without waiting
-                self._executor.shutdown(wait=False, cancel_futures=True)
-
-            self._executor = None

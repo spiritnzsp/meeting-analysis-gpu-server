@@ -258,6 +258,199 @@ def detect_audio_format(audio_data: bytes) -> Optional[str]:
     return None
 
 
+# Video format magic bytes for validation
+# Format: (magic_bytes, offset, format_name)
+VIDEO_MAGIC_BYTES = [
+    (b'\x00\x00\x00', 0, 'MP4'),           # MP4/MOV (ftyp box, first 3 bytes are size)
+    (b'ftyp', 4, 'MP4'),                    # MP4 container (ftyp at offset 4)
+    (b'\x1a\x45\xdf\xa3', 0, 'WebM/MKV'),  # WebM/Matroska EBML header
+    (b'RIFF', 0, 'AVI'),                    # AVI container
+    (b'\x47', 0, 'MPEG-TS'),               # MPEG Transport Stream sync byte
+    (b'\x00\x00\x01\xba', 0, 'MPEG-PS'),   # MPEG Program Stream
+    (b'\x00\x00\x01\xb3', 0, 'MPEG'),      # MPEG video sequence header
+]
+
+# Allowed NVENC video codecs
+ALLOWED_VIDEO_CODECS = {
+    "h264_nvenc", "hevc_nvenc", "av1_nvenc",
+}
+
+# Valid NVENC presets
+VALID_NVENC_PRESETS = {f"p{i}" for i in range(1, 8)}
+
+
+def detect_video_format(data: bytes) -> Optional[str]:
+    """
+    Detect video format from magic bytes.
+
+    Args:
+        data: The video data (at least first 12 bytes)
+
+    Returns:
+        Format name if recognized, None otherwise
+    """
+    if len(data) < 12:
+        return None
+
+    for magic, offset, format_name in VIDEO_MAGIC_BYTES:
+        if len(data) > offset + len(magic):
+            if data[offset:offset + len(magic)] == magic:
+                return format_name
+
+    return None
+
+
+def validate_video_data(data: bytes, max_size: int) -> bytes:
+    """
+    Validate video data including format check via magic bytes.
+
+    Args:
+        data: The video data bytes
+        max_size: Maximum allowed size in bytes
+
+    Returns:
+        The validated video data
+
+    Raises:
+        ValidationError: If validation fails
+    """
+    if not isinstance(data, bytes):
+        raise ValidationError("video_data", "Video data must be bytes")
+
+    if len(data) == 0:
+        raise ValidationError("video_data", "Video data is empty")
+
+    if len(data) > max_size:
+        raise ValidationError(
+            "video_data",
+            f"Video data exceeds maximum size ({max_size / 1024 / 1024:.0f} MB)"
+        )
+
+    detected_format = detect_video_format(data)
+    if detected_format is None:
+        raise ValidationError(
+            "video_data",
+            "Unrecognized video format. Supported: MP4, WebM/MKV, AVI, MPEG-TS"
+        )
+
+    return data
+
+
+def validate_video_codec(codec: Optional[str]) -> Optional[str]:
+    """
+    Validate a video codec name.
+
+    Args:
+        codec: Codec name or None for auto-select
+
+    Returns:
+        Validated codec name or None
+
+    Raises:
+        ValidationError: If codec is invalid
+    """
+    if codec is None:
+        return None
+
+    if not isinstance(codec, str):
+        raise ValidationError("codec", "Codec must be a string")
+
+    if codec not in ALLOWED_VIDEO_CODECS:
+        raise ValidationError(
+            "codec",
+            f"Invalid video codec. Allowed: {', '.join(sorted(ALLOWED_VIDEO_CODECS))}"
+        )
+
+    return codec
+
+
+def validate_nvenc_preset(preset: Optional[str]) -> Optional[str]:
+    """
+    Validate an NVENC preset.
+
+    Args:
+        preset: Preset name (p1-p7) or None for default
+
+    Returns:
+        Validated preset or None
+
+    Raises:
+        ValidationError: If preset is invalid
+    """
+    if preset is None:
+        return None
+
+    if not isinstance(preset, str):
+        raise ValidationError("preset", "Preset must be a string")
+
+    if preset not in VALID_NVENC_PRESETS:
+        raise ValidationError(
+            "preset",
+            "Invalid NVENC preset. Must be p1 (fastest) through p7 (best quality)"
+        )
+
+    return preset
+
+
+def validate_resolution(resolution: Optional[str]) -> Optional[str]:
+    """
+    Validate a video resolution string.
+
+    Args:
+        resolution: Resolution as "WIDTHxHEIGHT" or None
+
+    Returns:
+        Validated resolution or None
+
+    Raises:
+        ValidationError: If resolution is invalid
+    """
+    if resolution is None:
+        return None
+
+    if not isinstance(resolution, str):
+        raise ValidationError("resolution", "Resolution must be a string")
+
+    if not re.match(r'^\d{1,5}x\d{1,5}$', resolution):
+        raise ValidationError("resolution", "Resolution must be in WIDTHxHEIGHT format (e.g. '1920x1080')")
+
+    w, h = resolution.split('x')
+    if int(w) < 16 or int(h) < 16:
+        raise ValidationError("resolution", "Resolution dimensions must be at least 16")
+    if int(w) > 7680 or int(h) > 4320:
+        raise ValidationError("resolution", "Resolution dimensions exceed maximum (7680x4320)")
+
+    return resolution
+
+
+def validate_video_quality(quality: Optional[int]) -> Optional[int]:
+    """
+    Validate a video quality (CQ) value.
+
+    Args:
+        quality: CQ value 0-51 or None for default
+
+    Returns:
+        Validated quality or None
+
+    Raises:
+        ValidationError: If quality is invalid
+    """
+    if quality is None:
+        return None
+
+    if isinstance(quality, bool):
+        raise ValidationError("quality", "Quality must be an integer, not a boolean")
+
+    if not isinstance(quality, int):
+        raise ValidationError("quality", "Quality must be an integer")
+
+    if quality < 0 or quality > 51:
+        raise ValidationError("quality", "Quality must be between 0 and 51")
+
+    return quality
+
+
 def validate_audio_data(
     audio_data: bytes,
     max_size: int = 500 * 1024 * 1024,

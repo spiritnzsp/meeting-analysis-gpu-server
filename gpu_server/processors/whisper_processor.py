@@ -4,14 +4,12 @@ Whisper Transcription Processor
 GPU-accelerated speech-to-text using faster-whisper.
 """
 import asyncio
-import threading
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional, List, Callable, Awaitable, Tuple
 
 from ..config import WhisperConfig
 from ..protocol import TranscriptSegment, ProgressMessage, ProcessingStage
-from ..logging_config import get_logger, LogEvents
+from ..logging_config import get_logger
 from ..utils.temp_file import TempAudioFile
 
 logger = get_logger(__name__)
@@ -21,9 +19,10 @@ logger = get_logger(__name__)
 # This import happens after __init__.py defines ProcessorCancelled but before
 # it tries to import WhisperProcessor, so no circular import issue
 from . import ProcessorCancelled
+from .base_processor import BaseProcessor
 
 
-class WhisperProcessor:
+class WhisperProcessor(BaseProcessor):
     """
     Whisper transcription processor using faster-whisper.
 
@@ -43,24 +42,35 @@ class WhisperProcessor:
         Args:
             config: Whisper configuration
         """
+        super().__init__(thread_name_prefix="whisper_gpu")
         self.config = config
         self._model = None
         self._model_name = None
-        self._shutdown = False
 
-        # Cancellation tracking - use request_id to avoid TOCTOU race
-        # When cancel is called, we store the request_id that should be cancelled
-        # This avoids the race where clear() loses a cancellation
-        self._cancelled_request_id: Optional[str] = None
-        self._cancel_lock = threading.Lock()
+    @property
+    def processor_name(self) -> str:
+        return "Whisper"
 
-        # Operation tracking for safe timeout handling
-        self._operation_complete = asyncio.Event()
-        self._operation_complete.set()  # Initially not processing
-        self._is_processing = False
+    def _unload_resources(self) -> None:
+        """Unload the model to free GPU memory."""
+        if self._model is not None:
+            del self._model
+            self._model = None
+            self._model_name = None
+            logger.info("Whisper model unloaded")
 
-        # Dedicated thread pool for GPU operations to avoid blocking event loop
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="whisper_gpu")
+            # Force GPU memory cleanup
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except ImportError:
+                pass
+
+    # Keep unload() as a public alias for backward compatibility
+    def unload(self):
+        """Unload the model to free GPU memory."""
+        self._unload_resources()
 
     def _ensure_model_sync(self, model_name: Optional[str] = None):
         """Load the model if not already loaded (synchronous, runs in executor)."""
@@ -84,13 +94,6 @@ class WhisperProcessor:
         except Exception as e:
             logger.error(f"Failed to load Whisper model: {e}")
             raise
-
-    def _check_cancelled(self, request_id: str) -> None:
-        """Check if processing was cancelled and raise if so."""
-        with self._cancel_lock:
-            # Check for specific request cancellation or wildcard cancellation
-            if self._cancelled_request_id == request_id or self._cancelled_request_id == "__ANY__":
-                raise ProcessorCancelled("Transcription cancelled")
 
     def _transcribe_sync(
         self,
@@ -168,16 +171,8 @@ class WhisperProcessor:
             RuntimeError: If processor has been shut down
             ProcessorCancelled: If processing was cancelled
         """
-        if self._shutdown:
-            raise RuntimeError("WhisperProcessor has been shut down")
-
-        # Mark operation as in-progress (for timeout handling)
-        self._operation_complete.clear()
-        self._is_processing = True
-
-        # Clear any stale cancellation from previous request
-        with self._cancel_lock:
-            self._cancelled_request_id = None
+        self._check_shutdown()
+        self._begin_operation()
 
         loop = asyncio.get_running_loop()
 
@@ -255,110 +250,4 @@ class WhisperProcessor:
                     logger.warning(f"Transcription async cancelled for request {request_id}")
                     raise
         finally:
-            # Mark operation as complete
-            self._is_processing = False
-            self._operation_complete.set()
-
-    def cancel(self, request_id: str = "") -> None:
-        """
-        Cancel processing for a specific request.
-
-        Args:
-            request_id: The request ID to cancel. If empty, cancels any in-progress request.
-        """
-        with self._cancel_lock:
-            if request_id:
-                self._cancelled_request_id = request_id
-            elif self._is_processing:
-                # Cancel whatever is currently processing
-                self._cancelled_request_id = "__ANY__"
-        logger.info(f"Whisper processor cancellation requested for {request_id or 'current request'}")
-
-    async def wait_for_idle(self, timeout: float = 30.0) -> bool:
-        """
-        Wait for the processor to become idle.
-
-        Use this after cancelling to ensure GPU operations have completed
-        before starting a new request.
-
-        Args:
-            timeout: Maximum time to wait in seconds
-
-        Returns:
-            True if processor is idle, False if timeout occurred
-        """
-        if not self._is_processing:
-            return True
-
-        try:
-            await asyncio.wait_for(self._operation_complete.wait(), timeout=timeout)
-            return True
-        except asyncio.TimeoutError:
-            logger.warning(f"Timeout waiting for Whisper processor to become idle")
-            return False
-
-    @property
-    def is_processing(self) -> bool:
-        """Check if processor is currently running a GPU operation."""
-        return self._is_processing
-
-    def unload(self):
-        """Unload the model to free GPU memory."""
-        if self._model is not None:
-            del self._model
-            self._model = None
-            self._model_name = None
-            logger.info("Whisper model unloaded")
-
-            # Force GPU memory cleanup
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except ImportError:
-                pass
-
-    def shutdown(self, timeout: float = 30.0):
-        """
-        Shutdown the processor and release all resources. Safe to call multiple times.
-
-        Args:
-            timeout: Maximum time to wait for executor shutdown (default 30s)
-        """
-        if self._shutdown:
-            return  # Already shut down
-
-        self._shutdown = True
-
-        # Signal cancellation to any running operations
-        self.cancel()
-
-        self.unload()
-
-        # Shutdown the executor with timeout
-        if self._executor is not None:
-            logger.info("Shutting down Whisper executor...")
-
-            # Use a thread to implement timeout since ThreadPoolExecutor.shutdown() doesn't have one
-            shutdown_complete = threading.Event()
-
-            def do_shutdown():
-                try:
-                    self._executor.shutdown(wait=True, cancel_futures=False)
-                finally:
-                    shutdown_complete.set()
-
-            shutdown_thread = threading.Thread(target=do_shutdown, daemon=True)
-            shutdown_thread.start()
-
-            if shutdown_complete.wait(timeout=timeout):
-                logger.info("Whisper executor shutdown complete")
-            else:
-                logger.warning(
-                    f"Whisper executor shutdown timed out after {timeout}s, "
-                    "forcing shutdown (operations may still be running)"
-                )
-                # Force shutdown without waiting
-                self._executor.shutdown(wait=False, cancel_futures=True)
-
-            self._executor = None
+            self._end_operation()

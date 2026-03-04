@@ -241,6 +241,28 @@ class TLSConfig:
 
 
 @dataclass
+class VideoEncodingConfig:
+    """Video encoding configuration."""
+    enabled: bool = False
+    ffmpeg_path: str = "ffmpeg"
+    preferred_codecs: List[str] = field(default_factory=lambda: ["av1_nvenc", "hevc_nvenc", "h264_nvenc"])
+    default_preset: str = "p4"          # p1(fastest)..p7(best quality)
+    default_quality: int = 23           # CQ mode, 0-51
+    max_sessions: int = 2              # NVENC hardware session limit
+    max_input_size: int = 2 * 1024 * 1024 * 1024  # 2GB
+    data_upload_timeout: int = 300     # 5 min to complete upload after control message
+    temp_directory: Optional[str] = None  # Must NOT be tmpfs for large files
+
+
+@dataclass
+class VideoQueueConfig:
+    """Video encoding queue configuration."""
+    max_size: int = 50
+    request_timeout: int = 7200        # 2 hours
+    processing_timeout: int = 3600     # 1 hour
+
+
+@dataclass
 class Config:
     """Main configuration container."""
     server: ServerConfig = field(default_factory=ServerConfig)
@@ -250,6 +272,8 @@ class Config:
     pyannote: PyAnnoteConfig = field(default_factory=PyAnnoteConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     tls: TLSConfig = field(default_factory=TLSConfig)
+    video_encoding: VideoEncodingConfig = field(default_factory=VideoEncodingConfig)
+    video_queue: VideoQueueConfig = field(default_factory=VideoQueueConfig)
 
 
 def load_config(config_path: Optional[Path] = None, fail_on_error: bool = True) -> Config:
@@ -357,6 +381,30 @@ def load_config(config_path: Optional[Path] = None, fail_on_error: bool = True) 
                     require_client_cert=data['tls'].get('require_client_cert', config.tls.require_client_cert),
                 )
 
+            # Video encoding config
+            if 'video_encoding' in data:
+                ve = data['video_encoding']
+                config.video_encoding = VideoEncodingConfig(
+                    enabled=ve.get('enabled', config.video_encoding.enabled),
+                    ffmpeg_path=ve.get('ffmpeg_path', config.video_encoding.ffmpeg_path),
+                    preferred_codecs=ve.get('preferred_codecs', config.video_encoding.preferred_codecs),
+                    default_preset=ve.get('default_preset', config.video_encoding.default_preset),
+                    default_quality=ve.get('default_quality', config.video_encoding.default_quality),
+                    max_sessions=ve.get('max_sessions', config.video_encoding.max_sessions),
+                    max_input_size=ve.get('max_input_size', config.video_encoding.max_input_size),
+                    data_upload_timeout=ve.get('data_upload_timeout', config.video_encoding.data_upload_timeout),
+                    temp_directory=ve.get('temp_directory', config.video_encoding.temp_directory),
+                )
+
+            # Video queue config
+            if 'video_queue' in data:
+                vq = data['video_queue']
+                config.video_queue = VideoQueueConfig(
+                    max_size=vq.get('max_size', config.video_queue.max_size),
+                    request_timeout=vq.get('request_timeout', config.video_queue.request_timeout),
+                    processing_timeout=vq.get('processing_timeout', config.video_queue.processing_timeout),
+                )
+
         except Exception as e:
             if fail_on_error:
                 raise ConfigurationError(f"Failed to parse config file '{config_file}': {e}") from e
@@ -385,6 +433,14 @@ def load_config(config_path: Optional[Path] = None, fail_on_error: bool = True) 
     if os.environ.get('HUGGINGFACE_TOKEN'):
         # Read and immediately clear sensitive env var (consistent with API key handling)
         config.pyannote.huggingface_token = os.environ.pop('HUGGINGFACE_TOKEN')
+
+    # Video encoding environment variable overrides
+    if os.environ.get('GPU_SERVER_VIDEO_ENABLED'):
+        config.video_encoding.enabled = os.environ['GPU_SERVER_VIDEO_ENABLED'].lower() in ('true', '1', 'yes')
+    if os.environ.get('GPU_SERVER_FFMPEG_PATH'):
+        config.video_encoding.ffmpeg_path = os.environ['GPU_SERVER_FFMPEG_PATH']
+    if os.environ.get('GPU_SERVER_VIDEO_TEMP_DIR'):
+        config.video_encoding.temp_directory = os.environ['GPU_SERVER_VIDEO_TEMP_DIR']
 
     # TLS environment variable overrides
     if os.environ.get('GPU_SERVER_TLS_ENABLED'):
@@ -493,6 +549,20 @@ def validate_config(config: Config, strict: bool = True):
                     f"Invalid {name}.device: '{device}'. "
                     "Must be 'cpu', 'cuda', or 'cuda:N' where N is a GPU index"
                 )
+
+    # Video encoding validation
+    if config.video_encoding.enabled:
+        if config.video_encoding.default_quality < 0 or config.video_encoding.default_quality > 51:
+            errors.append(f"Invalid video_encoding.default_quality: {config.video_encoding.default_quality}. Must be 0-51")
+        valid_presets = {f"p{i}" for i in range(1, 8)}
+        if config.video_encoding.default_preset not in valid_presets:
+            errors.append(f"Invalid video_encoding.default_preset: '{config.video_encoding.default_preset}'. Must be p1-p7")
+        if config.video_encoding.max_sessions < 1:
+            errors.append(f"Invalid video_encoding.max_sessions: {config.video_encoding.max_sessions}. Must be >= 1")
+        if config.video_encoding.temp_directory:
+            temp_path = Path(config.video_encoding.temp_directory)
+            if not temp_path.exists():
+                warnings.append(f"Video encoding temp_directory does not exist: {temp_path}")
 
     # Log warnings
     for warning in warnings:
