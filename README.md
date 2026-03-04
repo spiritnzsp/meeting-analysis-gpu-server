@@ -1,25 +1,31 @@
 # Meeting Analysis GPU Server
 
-A WebSocket-based GPU processing service for meeting audio analysis. Provides centralised Whisper transcription and PyAnnote speaker diarisation for the [Meeting Analysis](https://github.com/spiritnzsp/meeting-analysis) application.
+A WebSocket-based GPU processing service for meeting audio analysis and video encoding. Provides centralised Whisper transcription, PyAnnote speaker diarisation, and NVENC hardware video encoding for the [Meeting Analysis](https://github.com/spiritnzsp/meeting-analysis) application.
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     GPU Server                              │
-│  ┌─────────────┐   ┌─────────────┐   ┌─────────────────┐   │
-│  │  WebSocket  │──▶│   Queue     │──▶│  GPU Worker     │   │
-│  │   Server    │◀──│  Manager    │◀──│  - Whisper      │   │
-│  └─────────────┘   └─────────────┘   │  - PyAnnote     │   │
-│        :8765                         └─────────────────┘   │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                        GPU Server                                │
+│  ┌─────────────┐   ┌──────────────┐   ┌──────────────────────┐  │
+│  │  WebSocket  │──▶│ Audio Queue  │──▶│  Audio Worker        │  │
+│  │   Server    │◀──│  Manager     │◀──│  - Whisper           │  │
+│  │   :8765     │   └──────────────┘   │  - PyAnnote          │  │
+│  │             │   ┌──────────────┐   └──────────────────────┘  │
+│  │  JSON + ────│──▶│ Video Queue  │──▶┌──────────────────────┐  │
+│  │  Binary     │◀──│  Manager     │◀──│  Video Worker        │  │
+│  └─────────────┘   └──────────────┘   │  - FFmpeg/NVENC      │  │
+│                                       └──────────────────────┘  │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
 ## Features
 
 - **Whisper transcription** with word-level timestamps
 - **PyAnnote speaker diarisation** with voice embeddings
-- **Request queuing** with priority support
+- **NVENC video encoding** with AV1, HEVC, and H.264 codec support
+- **Binary frame protocol** for streaming large video files (up to 5GB)
+- **Request queuing** with priority support (separate audio and video queues)
 - **Progress streaming** via WebSocket
 - **API key authentication** for remote access
 - **Automatic GPU detection** (CUDA/CPU fallback)
@@ -29,6 +35,7 @@ A WebSocket-based GPU processing service for meeting audio analysis. Provides ce
 - Python 3.10+
 - NVIDIA GPU with CUDA (recommended: 8GB+ VRAM)
 - PyTorch with CUDA support
+- FFmpeg with NVENC support (for video encoding)
 - ~10GB disk space for models
 
 ## Installation
@@ -71,6 +78,16 @@ whisper:
 pyannote:
   device: "cuda"
   huggingface_token: "hf_xxxxx"  # Required for PyAnnote models
+
+video_encoding:
+  enabled: true
+  ffmpeg_path: "ffmpeg"
+  preferred_codecs: ["av1_nvenc", "hevc_nvenc", "h264_nvenc"]
+  default_preset: "p4"       # p1 (fastest) to p7 (best quality)
+  default_quality: 23        # CQ value, 0-51
+  max_sessions: 2            # NVENC hardware session limit
+  max_input_size: 5368709120 # 5GB
+  data_upload_timeout: 600   # 10 min for large files
 ```
 
 ## Usage
@@ -139,6 +156,63 @@ The Meeting Analysis application connects via WebSocket:
   "embeddings": [...]
 }
 ```
+
+### Video encoding request
+
+Video encoding uses a binary frame protocol for efficient streaming of large files.
+
+**Step 1: Send JSON control message**
+
+```json
+{
+  "type": "video_encode",
+  "request_id": "uuid",
+  "filename": "recording.mp4",
+  "input_size": 3500000000,
+  "options": {
+    "codec": null,
+    "preset": null,
+    "quality": 28,
+    "resolution": null,
+    "framerate": null,
+    "bitrate": null,
+    "pixel_format": null
+  }
+}
+```
+
+All options are optional (null = server defaults). Valid codecs: `av1_nvenc`, `hevc_nvenc`, `h264_nvenc`. Valid presets: `p1`-`p7`.
+
+**Step 2: Stream video data as binary frames**
+
+After receiving the `queued` response, the client streams the file as binary WebSocket messages:
+
+```
+Binary frame format: [1B frame_type][1B id_length][N B request_id_utf8][payload]
+
+Frame types:
+  0x01 = VIDEO_INPUT  (client -> server)
+  0x02 = VIDEO_OUTPUT (server -> client)
+```
+
+The client sends `VIDEO_INPUT` frames with file data in chunks (recommended 512KB). An empty-payload `VIDEO_INPUT` frame signals upload complete.
+
+**Step 3: Receive encoding result**
+
+The server sends progress updates during encoding, then the result:
+
+```json
+{
+  "type": "video_result",
+  "request_id": "uuid",
+  "success": true,
+  "output_size": 500000000,
+  "codec_used": "hevc_nvenc",
+  "encoding_time": 45.2
+}
+```
+
+On success, the server streams the encoded output as `VIDEO_OUTPUT` binary frames (64KB chunks), terminated by an empty-payload frame.
 
 ## Remote Access (VPN)
 
