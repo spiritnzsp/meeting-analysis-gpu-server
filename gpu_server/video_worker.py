@@ -253,7 +253,115 @@ class VideoWorker:
         start_time = time.time()
 
         set_request_context(request_id=request.request_id)
-        logger.info(f"Processing video encode request: {request.filename}")
+        logger.info(
+            f"Processing video encode request: {request.filename} "
+            f"(transfer_method={request.transfer_method})"
+        )
+
+        if request.transfer_method == "shared_fs":
+            await self._process_shared_fs_request(queued, start_time)
+        else:
+            await self._process_websocket_request(queued, start_time)
+
+    async def _process_shared_fs_request(
+        self, queued: QueuedRequest, start_time: float,
+    ) -> None:
+        """Process a shared filesystem video encode request.
+
+        Input is read directly from the shared path. Output is written
+        directly to the shared path. No binary data is transferred
+        over the WebSocket — only JSON control messages.
+        """
+        request: VideoEncodeRequest = queued.request
+        websocket = queued.websocket
+
+        input_path = Path(request.input_path)
+        output_path = Path(request.output_path)
+
+        try:
+            if not input_path.exists():
+                await websocket.send(VideoEncodeResult(
+                    request_id=request.request_id,
+                    success=False,
+                    error_message=f"Input file not found on shared filesystem: {input_path}",
+                ).to_json())
+                return
+
+            # Ensure output directory exists
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+
+            # Progress callback
+            async def on_progress(percent: int, message: str):
+                try:
+                    await websocket.send(ProgressMessage(
+                        request_id=request.request_id,
+                        stage=ProcessingStage.ENCODING,
+                        percent=percent,
+                        message=message,
+                    ).to_json())
+                except Exception:
+                    pass
+
+            await on_progress(5, "Starting shared filesystem encoding...")
+
+            # Encode directly from/to shared filesystem paths
+            success, error, codec_used = await self._encoder.encode(
+                input_path=input_path,
+                output_path=output_path,
+                options=request.options,
+                progress_callback=on_progress,
+                request_id=request.request_id,
+            )
+
+            encoding_time = time.time() - start_time
+
+            if success:
+                output_size = output_path.stat().st_size if output_path.exists() else 0
+
+                # Send result — no binary frames needed, client reads from shared fs
+                await websocket.send(VideoEncodeResult(
+                    request_id=request.request_id,
+                    success=True,
+                    output_size=output_size,
+                    codec_used=codec_used,
+                    encoding_time=encoding_time,
+                ).to_json())
+
+                logger.info(
+                    f"Shared filesystem encoding complete: {codec_used}, "
+                    f"{output_size} bytes, {encoding_time:.1f}s, "
+                    f"output: {output_path}"
+                )
+            else:
+                await websocket.send(VideoEncodeResult(
+                    request_id=request.request_id,
+                    success=False,
+                    codec_used=codec_used,
+                    encoding_time=encoding_time,
+                    error_message=error,
+                ).to_json())
+                logger.error(f"Shared filesystem encoding failed: {error}")
+
+        except Exception as e:
+            logger.error(f"Shared filesystem video processing error: {e}", exc_info=True)
+            try:
+                await websocket.send(VideoEncodeResult(
+                    request_id=request.request_id,
+                    success=False,
+                    error_message="Video encoding failed",
+                ).to_json())
+            except Exception:
+                pass
+        finally:
+            self._current_request = None
+            clear_request_context()
+
+    async def _process_websocket_request(
+        self, queued: QueuedRequest, start_time: float,
+    ) -> None:
+        """Process a WebSocket chunked video encode request (v1.0 flow)."""
+        request: VideoEncodeRequest = queued.request
+        websocket = queued.websocket
 
         # Get the finalized input temp file
         temp_input = self._pending_uploads.get(request.request_id)

@@ -155,6 +155,20 @@ class GPUServer:
         self._worker_task = None
         self._video_worker_task = None
 
+    def _build_transfer_capabilities(self) -> dict:
+        """Build transfer_capabilities dict for auth_ok response."""
+        methods = ["websocket"]
+        shared_paths = []
+        if self.config.video_encoding.enabled:
+            if self.config.video_encoding.shared_paths:
+                methods.insert(0, "shared_fs")
+                shared_paths = self.config.video_encoding.shared_paths
+        return {
+            "methods": methods,
+            "shared_paths": shared_paths,
+            "max_websocket_chunk": 512 * 1024,
+        }
+
     async def start(self):
         """Start the server."""
         logger.info(
@@ -344,6 +358,7 @@ class GPUServer:
                 "server_version": __version__,
                 "protocol_version": PROTOCOL_VERSION_STRING,
                 "video_encoding_enabled": self.config.video_encoding.enabled,
+                "transfer_capabilities": self._build_transfer_capabilities(),
             }))
             logger.info(LogEvents.CLIENT_AUTHENTICATED, data={'auth_disabled': True})
             return True
@@ -407,6 +422,7 @@ class GPUServer:
                 "protocol_version": PROTOCOL_VERSION_STRING,
                 "queue_size": self.queue.size,
                 "video_encoding_enabled": self.config.video_encoding.enabled,
+                "transfer_capabilities": self._build_transfer_capabilities(),
             }))
 
             logger.info(
@@ -714,40 +730,85 @@ class GPUServer:
                     'filename': request.filename,
                     'input_size': request.input_size,
                     'priority': request.priority,
+                    'transfer_method': request.transfer_method,
                 }
             )
 
-            # Register upload (creates temp file)
-            self.video_worker.register_upload(request_id)
+            if request.transfer_method == "shared_fs":
+                # Shared filesystem: validate paths are under allowed shared_paths
+                for path_label, path_value in [("input_path", request.input_path), ("output_path", request.output_path)]:
+                    if not self._validate_shared_path(path_value, request_id, websocket):
+                        await websocket.send(ErrorMessage(
+                            request_id=request_id,
+                            error=f"Path not under any configured shared_paths: {path_value}",
+                            recoverable=False,
+                            error_code="SHARED_FS_PATH_NOT_ALLOWED",
+                        ).to_json())
+                        return
 
-            # Enqueue placeholder with pending_data=True
-            success = await self.video_queue.enqueue(
-                request, websocket, pending_data=True,
-            )
+                # Verify input file exists and is readable
+                input_path = Path(request.input_path)
+                if not input_path.exists():
+                    await websocket.send(ErrorMessage(
+                        request_id=request_id,
+                        error=f"Shared filesystem input file not found: {request.input_path}",
+                        recoverable=False,
+                        error_code="SHARED_FS_INPUT_NOT_FOUND",
+                    ).to_json())
+                    return
 
-            if success:
-                await websocket.send(json.dumps({
-                    "type": MessageType.QUEUED,
-                    "request_id": request_id,
-                    "position": self.video_queue.size,
-                }))
+                # Enqueue immediately as ready (no binary upload needed)
+                success = await self.video_queue.enqueue(
+                    request, websocket, pending_data=False,
+                )
 
-                # Send progress: waiting for data
-                await websocket.send(ProgressMessage(
-                    request_id=request_id,
-                    stage=ProcessingStage.RECEIVING_VIDEO,
-                    percent=0,
-                    message="Ready to receive video data",
-                ).to_json())
+                if success:
+                    await websocket.send(json.dumps({
+                        "type": MessageType.QUEUED,
+                        "request_id": request_id,
+                        "position": self.video_queue.size,
+                    }))
+                else:
+                    logger.warning("Video queue full")
+                    await websocket.send(ErrorMessage(
+                        request_id=request_id,
+                        error="Video queue is full, please try again later",
+                        recoverable=True,
+                        error_code="QUEUE_FULL",
+                    ).to_json())
             else:
-                logger.warning("Video queue full")
-                self.video_worker._cleanup_upload(request_id)
-                await websocket.send(ErrorMessage(
-                    request_id=request_id,
-                    error="Video queue is full, please try again later",
-                    recoverable=True,
-                    error_code="QUEUE_FULL",
-                ).to_json())
+                # WebSocket chunked transfer (existing v1.0 flow)
+                # Register upload (creates temp file)
+                self.video_worker.register_upload(request_id)
+
+                # Enqueue placeholder with pending_data=True
+                success = await self.video_queue.enqueue(
+                    request, websocket, pending_data=True,
+                )
+
+                if success:
+                    await websocket.send(json.dumps({
+                        "type": MessageType.QUEUED,
+                        "request_id": request_id,
+                        "position": self.video_queue.size,
+                    }))
+
+                    # Send progress: waiting for data
+                    await websocket.send(ProgressMessage(
+                        request_id=request_id,
+                        stage=ProcessingStage.RECEIVING_VIDEO,
+                        percent=0,
+                        message="Ready to receive video data",
+                    ).to_json())
+                else:
+                    logger.warning("Video queue full")
+                    self.video_worker._cleanup_upload(request_id)
+                    await websocket.send(ErrorMessage(
+                        request_id=request_id,
+                        error="Video queue is full, please try again later",
+                        recoverable=True,
+                        error_code="QUEUE_FULL",
+                    ).to_json())
 
         except ValidationError as e:
             await websocket.send(ErrorMessage(
@@ -763,6 +824,29 @@ class GPUServer:
                 error="Internal server error",
                 error_code="INTERNAL_ERROR",
             ).to_json())
+
+    def _validate_shared_path(self, path_str: str, request_id: str, websocket) -> bool:
+        """Validate that a path is under one of the configured shared_paths.
+
+        Security: prevents path traversal attacks by resolving the path
+        and checking it's genuinely under an allowed shared mount.
+
+        Returns True if valid. Sends error and returns False if invalid.
+        This is a synchronous check — caller must await the websocket.send
+        if this returns False (error is sent inline via _validate_shared_path_async).
+        """
+        resolved = Path(path_str).resolve()
+        for shared_path_str in self.config.video_encoding.shared_paths:
+            shared_path = Path(shared_path_str).resolve()
+            if resolved.is_relative_to(shared_path):
+                return True
+
+        logger.warning(
+            f"Shared path validation failed: {path_str} is not under any "
+            f"configured shared_paths: {self.config.video_encoding.shared_paths}"
+        )
+        # We can't await here since this is sync — caller handles async send
+        return False
 
     async def _handle_cancel(self, websocket: WebSocketServerProtocol, data: dict):
         """Handle a cancel request."""

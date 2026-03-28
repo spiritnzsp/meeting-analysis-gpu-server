@@ -252,6 +252,8 @@ class VideoEncodingConfig:
     max_input_size: int = 2 * 1024 * 1024 * 1024  # 2GB
     data_upload_timeout: int = 300     # 5 min to complete upload after control message
     temp_directory: Optional[str] = None  # Must NOT be tmpfs for large files
+    # Protocol v1.1: shared filesystem transfer
+    shared_paths: List[str] = field(default_factory=list)  # Paths accessible to both client and server
 
 
 @dataclass
@@ -394,6 +396,7 @@ def load_config(config_path: Optional[Path] = None, fail_on_error: bool = True) 
                     max_input_size=ve.get('max_input_size', config.video_encoding.max_input_size),
                     data_upload_timeout=ve.get('data_upload_timeout', config.video_encoding.data_upload_timeout),
                     temp_directory=ve.get('temp_directory', config.video_encoding.temp_directory),
+                    shared_paths=ve.get('shared_paths', config.video_encoding.shared_paths),
                 )
 
             # Video queue config
@@ -441,6 +444,11 @@ def load_config(config_path: Optional[Path] = None, fail_on_error: bool = True) 
         config.video_encoding.ffmpeg_path = os.environ['GPU_SERVER_FFMPEG_PATH']
     if os.environ.get('GPU_SERVER_VIDEO_TEMP_DIR'):
         config.video_encoding.temp_directory = os.environ['GPU_SERVER_VIDEO_TEMP_DIR']
+    if os.environ.get('GPU_SERVER_SHARED_PATHS'):
+        # Comma-separated list of shared paths
+        config.video_encoding.shared_paths = [
+            p.strip() for p in os.environ['GPU_SERVER_SHARED_PATHS'].split(',') if p.strip()
+        ]
 
     # TLS environment variable overrides
     if os.environ.get('GPU_SERVER_TLS_ENABLED'):

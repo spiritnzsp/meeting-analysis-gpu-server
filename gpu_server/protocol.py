@@ -24,9 +24,9 @@ from .validation import (
 
 # Protocol versioning
 # Format: (major, minor) - major version changes break compatibility
-PROTOCOL_VERSION = (1, 0)
+PROTOCOL_VERSION = (1, 1)
 PROTOCOL_VERSION_STRING = f"{PROTOCOL_VERSION[0]}.{PROTOCOL_VERSION[1]}"
-MIN_COMPATIBLE_VERSION = (1, 0)  # Minimum client version server will accept
+MIN_COMPATIBLE_VERSION = (1, 0)  # Minimum client version server will accept (v1.0 clients still supported)
 
 
 def parse_version(version_str: str) -> Tuple[int, int]:
@@ -375,6 +375,10 @@ class VideoEncodeRequest:
     input_size: int  # Expected size in bytes
     options: VideoCodecOptions = field(default_factory=VideoCodecOptions)
     priority: int = 0
+    # Protocol v1.1 transfer negotiation fields
+    transfer_method: str = "websocket"  # "websocket" or "shared_fs"
+    input_path: Optional[str] = None    # For shared_fs: server-side input path
+    output_path: Optional[str] = None   # For shared_fs: server-side output path
 
     @classmethod
     def from_dict(cls, data: Dict) -> 'VideoEncodeRequest':
@@ -410,12 +414,30 @@ class VideoEncodeRequest:
             pixel_format=opts.get("pixel_format"),
         )
 
+        # Protocol v1.1 transfer method
+        transfer_method = data.get("transfer_method", "websocket")
+        if transfer_method not in ("websocket", "shared_fs"):
+            transfer_method = "websocket"
+
+        input_path = data.get("input_path")
+        output_path = data.get("output_path")
+
+        # Validate shared_fs paths
+        if transfer_method == "shared_fs":
+            if not input_path or not isinstance(input_path, str):
+                raise ValidationError("input_path", "input_path is required for shared_fs transfer")
+            if not output_path or not isinstance(output_path, str):
+                raise ValidationError("output_path", "output_path is required for shared_fs transfer")
+
         return cls(
             request_id=request_id,
             filename=filename,
             input_size=input_size,
             options=options,
             priority=priority,
+            transfer_method=transfer_method,
+            input_path=input_path,
+            output_path=output_path,
         )
 
 
