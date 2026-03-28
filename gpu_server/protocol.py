@@ -379,6 +379,7 @@ class VideoEncodeRequest:
     transfer_method: str = "websocket"  # "websocket" or "shared_fs"
     input_path: Optional[str] = None    # For shared_fs: server-side input path
     output_path: Optional[str] = None   # For shared_fs: server-side output path
+    resume_offset: int = 0              # For websocket resume: byte offset to continue from
 
     @classmethod
     def from_dict(cls, data: Dict) -> 'VideoEncodeRequest':
@@ -429,6 +430,11 @@ class VideoEncodeRequest:
             if not output_path or not isinstance(output_path, str):
                 raise ValidationError("output_path", "output_path is required for shared_fs transfer")
 
+        # Resume offset for WebSocket uploads
+        resume_offset = data.get("resume_offset", 0)
+        if not isinstance(resume_offset, int) or resume_offset < 0:
+            resume_offset = 0
+
         return cls(
             request_id=request_id,
             filename=filename,
@@ -438,6 +444,7 @@ class VideoEncodeRequest:
             transfer_method=transfer_method,
             input_path=input_path,
             output_path=output_path,
+            resume_offset=resume_offset,
         )
 
 

@@ -255,6 +255,24 @@ class QueueManager:
                 return True
             return False
 
+    async def update_websocket(self, request_id: str, new_websocket) -> bool:
+        """
+        Update the websocket for a queued request (for resume after reconnect).
+
+        Args:
+            request_id: Request ID to update
+            new_websocket: New WebSocket connection
+
+        Returns:
+            True if updated, False if not found
+        """
+        async with self._lock:
+            if request_id in self._requests:
+                self._requests[request_id].websocket = new_websocket
+                logger.info(f"[{self.queue_name}] Updated websocket for request {request_id}")
+                return True
+            return False
+
     async def get_position(self, request_id: str) -> Optional[int]:
         """
         Get queue position for a request.

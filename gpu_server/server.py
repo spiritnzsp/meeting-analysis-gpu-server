@@ -776,8 +776,62 @@ class GPUServer:
                         recoverable=True,
                         error_code="QUEUE_FULL",
                     ).to_json())
+            elif request.resume_offset > 0:
+                # WebSocket resume: client reconnected after a drop
+                temp_file = self.video_worker._pending_uploads.get(request_id)
+                if temp_file is None:
+                    logger.warning(
+                        f"Resume failed: no pending upload for {request_id} "
+                        f"(may have timed out)"
+                    )
+                    await websocket.send(ErrorMessage(
+                        request_id=request_id,
+                        error="No pending upload found for this request. "
+                              "The partial upload may have expired.",
+                        recoverable=False,
+                        error_code="RESUME_NOT_FOUND",
+                    ).to_json())
+                    return
+
+                server_offset = temp_file.current_size
+                if server_offset != request.resume_offset:
+                    logger.warning(
+                        f"Resume offset mismatch for {request_id}: "
+                        f"client={request.resume_offset}, server={server_offset}"
+                    )
+                    await websocket.send(ErrorMessage(
+                        request_id=request_id,
+                        error=f"Resume offset mismatch: server has {server_offset} bytes, "
+                              f"client claims {request.resume_offset}",
+                        recoverable=False,
+                        error_code="RESUME_OFFSET_MISMATCH",
+                    ).to_json())
+                    return
+
+                # Update the queue entry's websocket to the new connection
+                await self.video_queue.update_websocket(request_id, websocket)
+
+                logger.info(
+                    f"Resuming upload for {request_id} at offset "
+                    f"{server_offset / 1024 / 1024:.1f}MB"
+                )
+
+                await websocket.send(json.dumps({
+                    "type": MessageType.QUEUED,
+                    "request_id": request_id,
+                    "position": self.video_queue.size,
+                    "resume_offset": server_offset,
+                }))
+
+                await websocket.send(ProgressMessage(
+                    request_id=request_id,
+                    stage=ProcessingStage.RECEIVING_VIDEO,
+                    percent=int(server_offset / request.input_size * 100) if request.input_size > 0 else 0,
+                    message=f"Resuming upload from {server_offset / 1024 / 1024:.1f}MB",
+                ).to_json())
+
             else:
-                # WebSocket chunked transfer (existing v1.0 flow)
+                # WebSocket chunked transfer (fresh upload)
                 # Register upload (creates temp file)
                 self.video_worker.register_upload(request_id)
 
