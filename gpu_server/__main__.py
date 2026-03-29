@@ -9,7 +9,7 @@ import signal
 import sys
 from pathlib import Path
 
-from .config import load_config, validate_config, ConfigurationError
+from .config import load_config, validate_config, ConfigurationError, VideoEncodingConfig
 from .server import GPUServer
 from .logging_config import configure_logging, get_logger
 
@@ -100,17 +100,20 @@ async def main():
         logger.error(f"Configuration validation failed:\n{e}")
         sys.exit(1)
 
-    # Check GPU availability
-    try:
-        import torch
-        if torch.cuda.is_available():
-            gpu_name = torch.cuda.get_device_name(0)
-            gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-            logger.info(f"GPU: {gpu_name} ({gpu_memory:.1f} GB)")
-        else:
-            logger.warning("CUDA not available - will use CPU (slow!)")
-    except ImportError:
-        logger.warning("PyTorch not installed - GPU detection skipped")
+    # Check GPU availability and auto-compute max input size from VRAM
+    from .gpu_info import detect_gpu
+    gpu = detect_gpu()
+    if gpu:
+        logger.info(f"GPU: {gpu.name} ({gpu.total_memory_gb:.1f} GB)")
+        # Auto-set max_input_size to 80% of VRAM if user hasn't overridden
+        default_max = VideoEncodingConfig().max_input_size
+        if config.video_encoding.max_input_size == default_max:
+            config.video_encoding.max_input_size = int(gpu.total_memory_bytes * 0.80)
+            logger.info(
+                f"  Max input size (auto): "
+                f"{config.video_encoding.max_input_size / 1024 / 1024:.0f} MB "
+                f"(80% of VRAM)"
+            )
 
     # Create and start server
     server = GPUServer(config)

@@ -167,6 +167,7 @@ class GPUServer:
             "methods": methods,
             "shared_paths": shared_paths,
             "max_websocket_chunk": 512 * 1024,
+            "max_input_size": self.config.video_encoding.max_input_size,
         }
 
     async def start(self):
