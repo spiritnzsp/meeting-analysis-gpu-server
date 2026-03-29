@@ -175,10 +175,13 @@ class VideoEncoderProcessor:
                 await progress_callback(5, f"Starting encoding with {codec}")
 
             # Run FFmpeg with progress parsing
+            # Use 1MB buffer limit (default 64KB is too small for large files
+            # where FFmpeg can emit very long stderr lines with warnings/diagnostics)
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                limit=1024 * 1024,
             )
             self._current_process = proc
 
