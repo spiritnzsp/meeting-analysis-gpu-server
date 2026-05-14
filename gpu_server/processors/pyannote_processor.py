@@ -8,8 +8,6 @@ import math
 from pathlib import Path
 from typing import Optional, List, Dict, Callable, Awaitable, Tuple
 
-import numpy as np
-
 from ..config import PyAnnoteConfig
 from ..protocol import (
     DiarizationSegment, SpeakerEmbedding, TranscriptSegment,
@@ -148,43 +146,52 @@ class PyAnnoteProcessor(BaseProcessor):
         if self._embedding_model is not None:
             return
 
-        try:
-            from pyannote.audio import Model
+        # Mirror the client's model choice so server-produced embeddings
+        # live in the same 256-dim vector space as client-produced ones
+        # (e.g. samples extracted by the voice-sample editor). No
+        # fallback: a 512-dim emergency model would produce vectors
+        # incompatible with the existing registry and find_matches would
+        # silently skip every comparison on dimension mismatch. Fail
+        # loud instead.
+        candidate_models = [
+            "pyannote/wespeaker-voxceleb-resnet34-LM",
+        ]
 
-            logger.info("Loading PyAnnote embedding model")
+        token = client_hf_token or self.config.huggingface_token
+        if client_hf_token:
+            logger.info("Using client-provided HuggingFace token for embedding model")
 
-            # Use client's token if provided, otherwise fall back to server config
-            # Client token is especially useful for first-time model download
-            token = client_hf_token or self.config.huggingface_token
-            if client_hf_token:
-                logger.info("Using client-provided HuggingFace token for embedding model")
-
-            # Try new API (token) first, fall back to old API (use_auth_token)
+        last_error: Optional[Exception] = None
+        for model_name in candidate_models:
             try:
-                self._embedding_model = Model.from_pretrained(
-                    "pyannote/embedding",
-                    token=token,
-                )
-            except TypeError:
-                # Older pyannote versions use use_auth_token
-                self._embedding_model = Model.from_pretrained(
-                    "pyannote/embedding",
-                    use_auth_token=token,
-                )
+                from pyannote.audio import Model
 
-            # Support both "cuda" and "cuda:N" device specifications
-            if self.config.device.startswith("cuda"):
-                import torch
-                if torch.cuda.is_available():
-                    device = torch.device(self.config.device)
-                    self._embedding_model = self._embedding_model.to(device)
-                    logger.info(f"PyAnnote embedding model moved to {self.config.device}")
+                logger.info(f"Trying embedding model: {model_name}")
 
-            logger.info("PyAnnote embedding model loaded")
+                try:
+                    self._embedding_model = Model.from_pretrained(model_name, token=token)
+                except TypeError:
+                    self._embedding_model = Model.from_pretrained(model_name, use_auth_token=token)
 
-        except Exception as e:
-            logger.error(f"Failed to load embedding model: {e}")
-            raise
+                # Support both "cuda" and "cuda:N" device specifications
+                if self.config.device.startswith("cuda"):
+                    import torch
+                    if torch.cuda.is_available():
+                        device = torch.device(self.config.device)
+                        self._embedding_model = self._embedding_model.to(device)
+                        logger.info(f"PyAnnote embedding model moved to {self.config.device}")
+
+                logger.info(f"Loaded embedding model {model_name}")
+                return
+            except Exception as e:
+                last_error = e
+                logger.warning(f"Failed to load {model_name}: {e}")
+                self._embedding_model = None
+
+        logger.error(f"Failed to load any embedding model. Last error: {last_error}")
+        raise RuntimeError(
+            f"Could not load any embedding model. Last error: {last_error}"
+        )
 
     def _diarize_sync(
         self,
@@ -228,30 +235,22 @@ class PyAnnoteProcessor(BaseProcessor):
 
         self._check_cancelled(request_id)
 
-        # Run diarization
+        # Run diarization. Embeddings are extracted in a separate pass via
+        # _extract_embeddings_sync (best-segment per speaker) so that each
+        # vector corresponds to a single, known audio window rather than a
+        # centroid averaged across every segment tagged with the speaker
+        # label - the latter contaminates the embedding whenever the
+        # diariser clumps multiple real speakers under one label.
         diarization_params = {}
         if num_speakers:
             diarization_params['num_speakers'] = num_speakers
-
-        # Request embeddings to be returned with diarization result
-        # This is essential for the attendee registry speaker identification feature
-        diarization_params['return_embeddings'] = True
 
         logger.info("Starting PyAnnote diarization...")
         diarization_result = self._pipeline(audio_input, **diarization_params)
 
         self._check_cancelled(request_id)
 
-        # Handle different PyAnnote return types
-        # When return_embeddings=True, PyAnnote returns (Annotation/DiarizeOutput, embeddings_tensor)
-        raw_embeddings_from_result = None
-        if isinstance(diarization_result, tuple) and len(diarization_result) == 2:
-            logger.info("Received tuple result from PyAnnote (diarization, embeddings)")
-            diarization_output, raw_embeddings_from_result = diarization_result
-            logger.info(f"Embeddings tensor type: {type(raw_embeddings_from_result)}, "
-                       f"shape: {raw_embeddings_from_result.shape if hasattr(raw_embeddings_from_result, 'shape') else 'N/A'}")
-        else:
-            diarization_output = diarization_result
+        diarization_output = diarization_result
 
         # DiarizeOutput (PyAnnote 3.x) wraps Annotation in speaker_diarization attribute
         if hasattr(diarization_output, 'speaker_diarization'):
@@ -291,132 +290,15 @@ class PyAnnoteProcessor(BaseProcessor):
         # Store speaker map for embedding key conversion
         self._last_speaker_map = speaker_map
 
-        # Extract pre-computed embeddings from diarization result
-        # This avoids needing to load a separate embedding model
+        # Embeddings are no longer extracted here. Leaving _last_embeddings
+        # empty causes extract_embeddings() to fall through to the
+        # best-segment-per-speaker pass in _extract_embeddings_sync, which
+        # produces one vector per speaker tied to a single known audio
+        # window. Centroid aggregation across all segments tagged with the
+        # same label silently inherits diariser clumping errors and was
+        # the cause of false-positive registry matches against degenerate
+        # mixed-speaker embeddings.
         self._last_embeddings = {}
-        try:
-            # Use embeddings from tuple result (return_embeddings=True)
-            # or fall back to speaker_embeddings attribute (DiarizeOutput)
-            raw_embeddings = raw_embeddings_from_result
-            if raw_embeddings is None:
-                raw_embeddings = getattr(diarization_output, 'speaker_embeddings', None)
-
-            if raw_embeddings is not None:
-                logger.info(f"Found pre-computed embeddings: type={type(raw_embeddings)}, "
-                           f"shape={raw_embeddings.shape if hasattr(raw_embeddings, 'shape') else 'N/A'}")
-
-                # Get unique speakers for index mapping
-                unique_speakers = list(speaker_map.keys())
-
-                # Build a map of best segment per speaker (longest segment for quality)
-                # Segments already have normalized labels at this point
-                speaker_best_segment: Dict[str, DiarizationSegment] = {}
-                for seg in segments:
-                    duration = seg.end - seg.start
-                    if seg.speaker not in speaker_best_segment:
-                        speaker_best_segment[seg.speaker] = seg
-                    elif duration > (speaker_best_segment[seg.speaker].end - speaker_best_segment[seg.speaker].start):
-                        speaker_best_segment[seg.speaker] = seg
-
-                # Handle SlidingWindowFeature format (frame-level embeddings from return_embeddings=True)
-                if hasattr(raw_embeddings, 'data') and hasattr(raw_embeddings, 'sliding_window'):
-                    # SlidingWindowFeature: compute per-speaker centroids
-                    logger.info("Processing SlidingWindowFeature embeddings...")
-                    frame_embeddings = raw_embeddings.data  # shape (num_frames, embedding_dim)
-                    sliding_window = raw_embeddings.sliding_window
-                    logger.info(f"Frame embeddings shape: {frame_embeddings.shape}, "
-                               f"num_frames: {len(frame_embeddings)}")
-
-                    # At this point, segments have normalized labels (Person-1, Person-2, etc.)
-                    # Compute speaker centroids by averaging frame embeddings within speaker segments
-                    normalized_speakers = set(seg.speaker for seg in segments)
-                    for normalized_label in normalized_speakers:
-                        speaker_frames = []
-                        for seg in segments:
-                            if seg.speaker == normalized_label:
-                                # Find frames within this segment's time range
-                                for frame_idx in range(len(frame_embeddings)):
-                                    frame_start = sliding_window[frame_idx].start
-                                    frame_end = sliding_window[frame_idx].end
-                                    frame_mid = (frame_start + frame_end) / 2
-                                    if seg.start <= frame_mid <= seg.end:
-                                        speaker_frames.append(frame_embeddings[frame_idx])
-
-                        if speaker_frames:
-                            # Compute centroid (mean of frame embeddings)
-                            centroid = np.mean(speaker_frames, axis=0)
-                            # Get timing from best segment
-                            best_seg = speaker_best_segment.get(normalized_label)
-                            if best_seg:
-                                seg_start = best_seg.start
-                                seg_duration = best_seg.end - best_seg.start
-                                quality = min(1.0, seg_duration / 10.0)
-                            else:
-                                seg_start, seg_duration, quality = 0.0, 0.0, 0.8
-                            self._last_embeddings[normalized_label] = [(centroid, seg_start, seg_duration, quality)]
-                            logger.info(f"Computed centroid for {normalized_label}: dim={len(centroid)}, "
-                                       f"frames={len(speaker_frames)}, segment={seg_start:.1f}-{seg_start+seg_duration:.1f}s")
-
-                elif isinstance(raw_embeddings, np.ndarray) and len(raw_embeddings) > 0:
-                    # Embeddings are array: shape (num_speakers, embedding_dim)
-                    # CRITICAL: PyAnnote orders embeddings alphabetically (SPEAKER_00, SPEAKER_01, ...)
-                    # but unique_speakers is in first-appearance order. We must sort to match.
-                    unique_speakers_sorted = sorted(unique_speakers)
-                    logger.info(f"Speaker label mapping: first-appearance={unique_speakers}, "
-                               f"sorted (PyAnnote order)={unique_speakers_sorted}")
-
-                    for idx, orig_label in enumerate(unique_speakers_sorted):
-                        if idx < len(raw_embeddings):
-                            emb_np = raw_embeddings[idx]
-                            if hasattr(emb_np, 'cpu'):
-                                emb_np = emb_np.cpu().numpy()
-                            normalized_label = speaker_map[orig_label]
-                            # Get timing from best segment
-                            best_seg = speaker_best_segment.get(normalized_label)
-                            if best_seg:
-                                seg_start = best_seg.start
-                                seg_duration = best_seg.end - best_seg.start
-                                quality = min(1.0, seg_duration / 10.0)
-                            else:
-                                seg_start, seg_duration, quality = 0.0, 0.0, 0.8
-                            self._last_embeddings[normalized_label] = [(emb_np, seg_start, seg_duration, quality)]
-                            logger.info(f"Stored embedding for {normalized_label} (from {orig_label}): dim={len(emb_np)}, "
-                                       f"segment={seg_start:.1f}-{seg_start+seg_duration:.1f}s")
-
-                elif hasattr(raw_embeddings, 'items'):
-                    # Dict format
-                    for orig_label, embedding in raw_embeddings.items():
-                        if hasattr(embedding, 'cpu'):
-                            emb_np = embedding.cpu().numpy()
-                        elif hasattr(embedding, 'numpy'):
-                            emb_np = embedding.numpy()
-                        else:
-                            emb_np = np.array(embedding)
-                        normalized_label = speaker_map.get(orig_label, orig_label)
-                        # Get timing from best segment
-                        best_seg = speaker_best_segment.get(normalized_label)
-                        if best_seg:
-                            seg_start = best_seg.start
-                            seg_duration = best_seg.end - best_seg.start
-                            quality = min(1.0, seg_duration / 10.0)
-                        else:
-                            seg_start, seg_duration, quality = 0.0, 0.0, 0.8
-                        self._last_embeddings[normalized_label] = [(emb_np, seg_start, seg_duration, quality)]
-                        logger.info(f"Stored embedding for {normalized_label}: dim={len(emb_np)}, "
-                                   f"segment={seg_start:.1f}-{seg_start+seg_duration:.1f}s")
-
-                if self._last_embeddings:
-                    logger.info(f"Extracted {len(self._last_embeddings)} pre-computed embeddings:")
-                    for label, emb_list in self._last_embeddings.items():
-                        if emb_list:
-                            emb_np, start, dur, qual = emb_list[0]
-                            logger.info(f"  {label}: dim={len(emb_np)}, segment={start:.1f}s-{start+dur:.1f}s, quality={qual:.2f}")
-                else:
-                    logger.warning("Could not extract speaker embeddings from provided format")
-            else:
-                logger.info("No pre-computed speaker_embeddings in diarization result")
-        except Exception as e:
-            logger.warning(f"Failed to extract pre-computed embeddings: {e}")
 
         logger.info(f"Diarization complete: {len(segments)} segments, {len(speaker_map)} speakers")
         return segments
