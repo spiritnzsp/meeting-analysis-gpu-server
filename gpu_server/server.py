@@ -200,7 +200,12 @@ class GPUServer:
             self.config.server.port,
             max_size=self.config.server.max_message_size,
             ping_interval=30,
-            ping_timeout=10,
+            # ping_timeout=None: do not terminate a connection because a
+            # pong was slow. Successful sends are themselves liveness
+            # proof; pings are kept as a periodic diagnostic and to
+            # service NAT/middlebox keepalive on long-haul VPN paths.
+            # See video_worker chunk-send loop comments for context.
+            ping_timeout=None,
             ssl=ssl_context,
         )
 

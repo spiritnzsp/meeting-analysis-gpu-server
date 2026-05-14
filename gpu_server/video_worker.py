@@ -27,6 +27,24 @@ from .logging_config import (
 logger = get_logger(__name__)
 
 
+# Chunk-send tuning for the WebSocket result download path. These are
+# protocol-internal performance constants - not user-facing config -
+# because the wrong values silently re-create a real production bug:
+#
+# Originally 64KB chunks were sent in a tight `await websocket.send(...)`
+# loop with no event-loop yield. On a fast LAN a 550MB result produced
+# ~8800 sends; pong frames queue behind data frames in the websockets
+# outgoing buffer and the client's ping_timeout fired mid-transfer.
+# On a slow link (e.g. transcontinental VPN) bandwidth backpressure
+# kept the queue shallow and the bug never showed.
+#
+# Combined with ping_timeout=None on both ends (server.py / client),
+# these values eliminate the failure mode: fewer awaits and explicit
+# cooperative yields keep the event loop fair regardless of network.
+_CHUNK_SIZE = 1024 * 1024   # 1MB
+_YIELD_EVERY_CHUNKS = 8     # cooperative `await asyncio.sleep(0)` cadence
+
+
 class VideoWorker:
     """
     Video encoding worker.
@@ -426,12 +444,20 @@ class VideoWorker:
                     encoding_time=encoding_time,
                 ).to_json())
 
-                # Send encoded video data as binary frames
+                # Send encoded video data as binary frames. See the
+                # _CHUNK_SIZE / _YIELD_EVERY_CHUNKS comment at module
+                # top for the constants' rationale.
                 if output_path.exists():
-                    chunk_size = 64 * 1024  # 64KB chunks
+                    loop = asyncio.get_running_loop()
                     with open(output_path, 'rb') as f:
+                        chunk_count = 0
                         while True:
-                            chunk = f.read(chunk_size)
+                            # Off-thread read so disk IO does not block
+                            # the event loop while the kernel readahead
+                            # populates the next chunk.
+                            chunk = await loop.run_in_executor(
+                                None, f.read, _CHUNK_SIZE,
+                            )
                             if not chunk:
                                 break
                             frame = encode_binary_frame(
@@ -440,6 +466,12 @@ class VideoWorker:
                                 chunk,
                             )
                             await websocket.send(frame)
+                            chunk_count += 1
+                            if chunk_count % _YIELD_EVERY_CHUNKS == 0:
+                                # Cooperative yield: lets the ping/pong
+                                # handler and any other concurrent tasks
+                                # run before the next chunk is queued.
+                                await asyncio.sleep(0)
 
                     # Send empty final frame to signal end
                     await websocket.send(encode_binary_frame(
