@@ -62,6 +62,17 @@ class LlmProcessor(BaseProcessor):
             return
         if not self._config.model_path:
             raise RuntimeError("LLM model_path is not configured")
+        # Import torch BEFORE llama_cpp: the llama-cpp-python wheel bundles an
+        # older CUDA runtime (cu124) than torch (cu128); if llama_cpp initialises
+        # CUDA first, torch's later import dies with an undefined-symbol error
+        # against the already-loaded libcudart. torch-first pins the newer
+        # runtime, which the cu124 llama build runs against fine. The server
+        # usually imports torch at startup (gpu_info) and the arbiter probe forces
+        # it before this load, but pin it here so the LLM path is safe regardless.
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            pass
         from llama_cpp import Llama
 
         t0 = time.time()
