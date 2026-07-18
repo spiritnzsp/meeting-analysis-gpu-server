@@ -44,6 +44,7 @@ class ManagedModel(Protocol):
 
     key: str
     estimated_vram_bytes: int
+    is_busy: bool  # whether an operation/lease currently holds this model
 
     def is_loaded(self) -> bool: ...
     async def load(self) -> None: ...

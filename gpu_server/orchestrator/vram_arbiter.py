@@ -74,15 +74,23 @@ class VramArbiter:
         eviction_policy: Optional[EvictionPolicy] = None,
         clock: Callable[[], float] = time.monotonic,
         oom_predicate: Callable[[BaseException], bool] = _looks_like_oom,
+        busy_wait_seconds: float = 1800.0,
     ):
         self._probe = probe
         self._headroom = headroom_bytes
         self._policy = eviction_policy or LruEvictionPolicy()
         self._clock = clock
         self._is_oom = oom_predicate
+        # Max time an admission will wait for a HELD model's lease to release
+        # before giving up (and letting the load OOM-tolerantly try). Bounds a
+        # stuck holder from wedging admission forever.
+        self._busy_wait_seconds = busy_wait_seconds
         self._registry: dict[str, _RegistryEntry] = {}
         self._transient_reserved = 0
         self._admission_lock = asyncio.Lock()
+        # Set whenever a lease releases; an admission blocked on a HELD victim
+        # waits on this and retries (P0-3 held-victim backpressure).
+        self._release_event = asyncio.Event()
 
     # --- registration ------------------------------------------------------
 
@@ -145,7 +153,36 @@ class VramArbiter:
         if entry.model.is_loaded():
             return
         need_bytes = entry.model.estimated_vram_bytes
-        await self._make_room(need_bytes, protect)
+
+        # Make room. If it doesn't fit only because the VRAM is HELD by another
+        # job's active lease, wait for a release and retry rather than
+        # OOM-failing this job (P0-3): two workloads that can't co-reside on the
+        # card serialize instead of one hard-failing. Bounded by
+        # busy_wait_seconds so a stuck holder can't wedge admission forever. If
+        # the shortfall is NOT due to a held model (genuinely absent VRAM), fall
+        # straight through to the OOM-tolerant load below.
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._busy_wait_seconds
+        while True:
+            self._release_event.clear()  # clear BEFORE checking (no lost wakeup)
+            await self._make_room(need_bytes, protect)
+            if self._current_budget().can_fit(need_bytes):
+                break
+            if not self._has_held_evictable(protect):
+                break  # nothing more to free — let the load try (may OOM)
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                logger.warning(
+                    f"Timed out waiting {self._busy_wait_seconds:.0f}s for VRAM "
+                    f"to load '{key}'; attempting load anyway"
+                )
+                break
+            logger.info(f"Waiting for a held model to release before loading '{key}'")
+            try:
+                await asyncio.wait_for(self._release_event.wait(), timeout=remaining)
+            except asyncio.TimeoutError:
+                break
+
         try:
             await entry.model.load()
         except BaseException as exc:  # noqa: BLE001 - re-raised unless OOM
@@ -158,6 +195,18 @@ class VramArbiter:
             )
             await self._make_room(need_bytes, protect, aggressive=True)
             await entry.model.load()
+
+    def _has_held_evictable(self, protect: set[str]) -> bool:
+        """Whether some loaded, unprotected resident is currently HELD by a lease
+        — i.e. waiting for a release could free room."""
+        return any(
+            k not in protect and e.model.is_loaded() and e.model.is_busy
+            for k, e in self._registry.items()
+        )
+
+    def _notify_release(self) -> None:
+        """Wake an admission blocked on a held victim (called by GpuLease)."""
+        self._release_event.set()
 
     async def _make_room(
         self, need_bytes: int, protect: set[str], aggressive: bool = False
@@ -260,6 +309,9 @@ class GpuLease:
         for model in self._held_models:
             model.end_operation()
         self._arbiter._release_transient(self._need.transient_bytes)
+        # Wake any admission blocked waiting for these models / this transient to
+        # free up (P0-3 backpressure).
+        self._arbiter._notify_release()
 
     def __del__(self):
         # Backstop only: a correctly-used lease is already released. Warn and

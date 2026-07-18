@@ -95,11 +95,12 @@ class FakeClock:
         return self.t
 
 
-def _arbiter(probe=None, headroom_gb=0):
+def _arbiter(probe=None, headroom_gb=0, busy_wait_seconds=1800.0):
     return VramArbiter(
         probe=probe or FakeProbe(total_gb=16),
         headroom_bytes=int(headroom_gb * GB),
         clock=FakeClock(),
+        busy_wait_seconds=busy_wait_seconds,
     )
 
 
@@ -171,15 +172,44 @@ async def test_required_models_are_protected_from_eviction():
         assert c.unload_calls == 1
 
 
-async def test_held_model_is_never_evicted():
-    arb = _arbiter(probe=FakeProbe(total_gb=10))  # tight: forces an eviction attempt
+async def test_held_model_blocks_admission_until_release():
+    # P0-3: two workloads that can't co-reside SERIALIZE — a held model is never
+    # evicted mid-use; the competing admission WAITS and proceeds on release.
+    import asyncio
+    arb = _arbiter(probe=FakeProbe(total_gb=10))  # tight: target can't fit beside held
     held, target = FakeModel("held", 6), FakeModel("target", 6)
     arb.register(held)
     arb.register(target)
-    async with await arb.acquire(WorkloadNeed(required_models=("held",))):  # in use
-        async with await arb.acquire(WorkloadNeed(required_models=("target",))):
-            assert held.unload_calls == 0   # a held model is never torn down
-            assert held.is_loaded()
+    lease = await arb.acquire(WorkloadNeed(required_models=("held",)))  # held in use
+
+    task = asyncio.ensure_future(arb.acquire(WorkloadNeed(required_models=("target",))))
+    await asyncio.sleep(0.05)
+    assert not task.done()          # blocked: held is in use, target can't fit
+    assert held.unload_calls == 0   # held is NOT torn down while in use
+    assert not target.is_loaded()
+
+    lease.release()                 # holder done -> wakes admission, evicts held
+    target_lease = await asyncio.wait_for(task, timeout=2.0)
+    assert held.unload_calls == 1
+    assert target.is_loaded()
+    target_lease.release()
+
+
+async def test_held_backpressure_is_bounded_by_timeout():
+    # A holder that never releases must not wedge admission forever: after
+    # busy_wait_seconds the load is attempted anyway (held still not evicted).
+    arb = _arbiter(probe=FakeProbe(total_gb=10), busy_wait_seconds=0.1)
+    held, target = FakeModel("held", 6), FakeModel("target", 6)
+    arb.register(held)
+    arb.register(target)
+    async with await arb.acquire(WorkloadNeed(required_models=("held",))):
+        lease = await asyncio.wait_for(
+            arb.acquire(WorkloadNeed(required_models=("target",))), timeout=2.0
+        )
+        assert held.unload_calls == 0   # never evicted (still held)
+        assert held.is_loaded()
+        assert target.is_loaded()       # loaded anyway after the wait timed out
+        lease.release()
 
 
 async def test_oom_on_load_triggers_aggressive_evict_and_retry():
