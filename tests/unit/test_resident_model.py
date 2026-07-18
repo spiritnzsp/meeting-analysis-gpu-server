@@ -101,6 +101,36 @@ async def test_begin_operation_refuses_when_not_loaded(executor):
     assert m.begin_operation() is False
 
 
+async def test_unload_without_reservation_raises(executor):
+    # S2: unload enforces its precondition rather than tearing down blindly.
+    m = _model(executor)
+    await m.load()
+    with pytest.raises(RuntimeError, match="reservation"):
+        await m.unload()
+    assert m.is_loaded()  # untouched
+
+
+async def test_unload_serializes_behind_executor_work(executor):
+    # F1 (the real property, not just thread identity): an unload submitted to
+    # the model's single-thread executor runs AFTER work already queued there,
+    # so teardown cannot race an in-flight inference on that same executor.
+    import time
+
+    order = []
+
+    def prior():
+        time.sleep(0.05)
+        order.append("prior")
+
+    m = _model(executor, unload_fn=lambda: order.append("unload"))
+    await m.load()
+    assert m.try_reserve_for_eviction()
+    fut = executor.submit(prior)   # occupy the executor first
+    await m.unload()               # queued behind `prior` on the same executor
+    fut.result()
+    assert order == ["prior", "unload"]
+
+
 async def test_load_failure_leaves_model_unloaded(executor):
     def boom():
         raise RuntimeError("CUDA out of memory")

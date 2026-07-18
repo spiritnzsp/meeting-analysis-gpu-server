@@ -1,9 +1,13 @@
 """Tests for VramArbiter — admission, eviction, protection, OOM-tolerance, leases.
 
 Uses fake models (satisfying the ManagedModel protocol, no GPU) and a scripted
-memory probe so admission decisions are deterministic. The probe reports all
-memory free, so admission is driven by the arbiter's own resident accounting.
+memory probe so admission decisions are deterministic. A model becomes evictable
+only after its lease is released (end_operation), so tests use ``async with`` to
+model a finished job vs. an in-use one.
 """
+import asyncio
+import gc
+
 import pytest
 
 from gpu_server.gpu_info import GpuSnapshot
@@ -13,24 +17,34 @@ GB = 1024 ** 3
 
 
 class FakeModel:
-    """In-memory ManagedModel: tracks load/unload calls, can simulate a
-    one-shot OOM and a busy (in-operation) state."""
+    """In-memory ManagedModel: tracks load/unload calls, simulates OOM (once or
+    always), a non-OOM load error, and the refcounted busy/eviction state."""
 
-    def __init__(self, key, vram_gb, oom_once=False):
+    def __init__(self, key, vram_gb, oom_once=False, oom_always=False, load_error=None):
         self.key = key
         self.estimated_vram_bytes = int(vram_gb * GB)
         self._loaded = False
-        self._busy = False
+        self._op_count = 0
         self._evicting = False
         self._oom_once = oom_once
+        self._oom_always = oom_always
+        self._load_error = load_error
         self.load_calls = 0
         self.unload_calls = 0
 
     def is_loaded(self):
         return self._loaded
 
+    @property
+    def is_busy(self):
+        return self._op_count > 0
+
     async def load(self):
         self.load_calls += 1
+        if self._load_error is not None:
+            raise self._load_error
+        if self._oom_always:
+            raise RuntimeError("CUDA out of memory")
         if self._oom_once:
             self._oom_once = False
             raise RuntimeError("CUDA out of memory")
@@ -42,7 +56,7 @@ class FakeModel:
         self._evicting = False
 
     def try_reserve_for_eviction(self):
-        if not self._loaded or self._busy or self._evicting:
+        if not self._loaded or self._op_count > 0 or self._evicting:
             return False
         self._evicting = True
         return True
@@ -53,11 +67,12 @@ class FakeModel:
     def begin_operation(self):
         if not self._loaded or self._evicting:
             return False
-        self._busy = True
+        self._op_count += 1
         return True
 
     def end_operation(self):
-        self._busy = False
+        if self._op_count > 0:
+            self._op_count -= 1
 
 
 class FakeProbe:
@@ -101,8 +116,10 @@ async def test_already_loaded_model_is_not_reloaded():
     arb = _arbiter()
     m = FakeModel("whisper", 6)
     arb.register(m)
-    await arb.acquire(WorkloadNeed(required_models=("whisper",)))
-    await arb.acquire(WorkloadNeed(required_models=("whisper",)))
+    async with await arb.acquire(WorkloadNeed(required_models=("whisper",))):
+        pass
+    async with await arb.acquire(WorkloadNeed(required_models=("whisper",))):
+        pass
     assert m.load_calls == 1
 
 
@@ -111,13 +128,30 @@ async def test_evicts_lru_to_make_room():
     whisper, pyannote, llm = FakeModel("whisper", 6), FakeModel("pyannote", 6), FakeModel("llm", 6)
     for m in (whisper, pyannote, llm):
         arb.register(m)
-    await arb.acquire(WorkloadNeed(required_models=("whisper",)))    # loaded first (oldest)
-    await arb.acquire(WorkloadNeed(required_models=("pyannote",)))   # 12GB resident now
-    await arb.acquire(WorkloadNeed(required_models=("llm",)))        # needs 6, only 4 free
-    # Oldest (whisper) evicted to fit the LLM; pyannote (more recent) survives.
-    assert whisper.unload_calls == 1
-    assert not whisper.is_loaded()
-    assert set(arb.loaded_keys()) == {"pyannote", "llm"}
+    # Two finished jobs leave whisper (older) and pyannote (newer) idle+loaded.
+    async with await arb.acquire(WorkloadNeed(required_models=("whisper",))):
+        pass
+    async with await arb.acquire(WorkloadNeed(required_models=("pyannote",))):
+        pass
+    async with await arb.acquire(WorkloadNeed(required_models=("llm",))):
+        assert whisper.unload_calls == 1     # LRU idle victim
+        assert not whisper.is_loaded()
+        assert set(arb.loaded_keys()) == {"pyannote", "llm"}
+
+
+async def test_in_use_required_model_is_not_evicted_by_concurrent_admission():
+    # S1: the model an in-flight job holds must not be evicted to admit another.
+    arb = _arbiter()  # 16GB
+    whisper, pyannote, llm = FakeModel("whisper", 6), FakeModel("pyannote", 6), FakeModel("llm", 6)
+    for m in (whisper, pyannote, llm):
+        arb.register(m)
+    async with await arb.acquire(WorkloadNeed(required_models=("whisper",))):  # whisper IN USE
+        async with await arb.acquire(WorkloadNeed(required_models=("pyannote",))):
+            pass  # pyannote now idle+loaded; card holds whisper(6)+pyannote(6)
+        async with await arb.acquire(WorkloadNeed(required_models=("llm",))):
+            assert whisper.is_loaded()
+            assert whisper.unload_calls == 0   # in-use model protected
+            assert not pyannote.is_loaded()    # the idle one was evicted instead
 
 
 async def test_required_models_are_protected_from_eviction():
@@ -125,27 +159,27 @@ async def test_required_models_are_protected_from_eviction():
     a, b, c = FakeModel("a", 6), FakeModel("b", 6), FakeModel("c", 6)
     for m in (a, b, c):
         arb.register(m)
-    await arb.acquire(WorkloadNeed(required_models=("a",)))   # a loaded
-    await arb.acquire(WorkloadNeed(required_models=("c",)))   # c loaded -> 12GB
-    # Now need both a and b; b must load, room must come from c, NOT from a.
-    await arb.acquire(WorkloadNeed(required_models=("a", "b")))
-    assert a.is_loaded()           # protected: survived
-    assert b.is_loaded()
-    assert not c.is_loaded()       # evicted instead
-    assert c.unload_calls == 1
+    async with await arb.acquire(WorkloadNeed(required_models=("a",))):
+        pass
+    async with await arb.acquire(WorkloadNeed(required_models=("c",))):
+        pass  # a and c idle+loaded -> 12GB
+    # Need both a and b; b must load, room must come from idle c, NOT from a.
+    async with await arb.acquire(WorkloadNeed(required_models=("a", "b"))):
+        assert a.is_loaded()           # protected: survived
+        assert b.is_loaded()
+        assert not c.is_loaded()       # evicted instead
+        assert c.unload_calls == 1
 
 
-async def test_busy_model_is_never_evicted():
+async def test_held_model_is_never_evicted():
     arb = _arbiter(probe=FakeProbe(total_gb=10))  # tight: forces an eviction attempt
-    busy, target = FakeModel("busy", 6), FakeModel("target", 6)
-    arb.register(busy)
+    held, target = FakeModel("held", 6), FakeModel("target", 6)
+    arb.register(held)
     arb.register(target)
-    await arb.acquire(WorkloadNeed(required_models=("busy",)))
-    assert busy.begin_operation()  # busy is mid-operation
-    # target needs 6GB but only 4 is free; the only candidate (busy) is in-op.
-    await arb.acquire(WorkloadNeed(required_models=("target",)))
-    assert busy.unload_calls == 0  # F3: a busy model is never torn down
-    assert busy.is_loaded()
+    async with await arb.acquire(WorkloadNeed(required_models=("held",))):  # in use
+        async with await arb.acquire(WorkloadNeed(required_models=("target",))):
+            assert held.unload_calls == 0   # a held model is never torn down
+            assert held.is_loaded()
 
 
 async def test_oom_on_load_triggers_aggressive_evict_and_retry():
@@ -154,12 +188,43 @@ async def test_oom_on_load_triggers_aggressive_evict_and_retry():
     llm = FakeModel("llm", 6, oom_once=True)
     arb.register(victim)
     arb.register(llm)
-    await arb.acquire(WorkloadNeed(required_models=("victim",)))  # victim resident
-    # llm's first load raises OOM despite accounting; arbiter evicts and retries.
-    await arb.acquire(WorkloadNeed(required_models=("llm",)))
-    assert llm.load_calls == 2      # failed once, retried once
-    assert llm.is_loaded()
-    assert victim.unload_calls == 1  # freed on the aggressive pass
+    async with await arb.acquire(WorkloadNeed(required_models=("victim",))):
+        pass  # victim idle+loaded
+    async with await arb.acquire(WorkloadNeed(required_models=("llm",))):
+        assert llm.load_calls == 2       # failed once, retried once
+        assert llm.is_loaded()
+        assert victim.unload_calls == 1  # freed on the aggressive pass
+
+
+async def test_persistent_oom_propagates_after_retry():
+    arb = _arbiter()
+    llm = FakeModel("llm", 6, oom_always=True)
+    arb.register(llm)
+    with pytest.raises(RuntimeError, match="out of memory"):
+        await arb.acquire(WorkloadNeed(required_models=("llm",)))
+    assert llm.load_calls == 2  # tried, aggressive-evicted, retried, still OOM -> raised
+
+
+async def test_non_oom_load_error_propagates_immediately():
+    arb = _arbiter()
+    m = FakeModel("m", 6, load_error=RuntimeError("boom"))
+    arb.register(m)
+    with pytest.raises(RuntimeError, match="boom"):
+        await arb.acquire(WorkloadNeed(required_models=("m",)))
+    assert m.load_calls == 1  # no retry for a non-OOM error
+
+
+async def test_admission_uses_driver_free_when_lower_than_accounting():
+    # F6 pessimism: our accounting says room, but the driver reports little free
+    # (another process holds VRAM) -> the driver figure must force an eviction.
+    arb = _arbiter(probe=FakeProbe(total_gb=16, free_gb=4))
+    a, b = FakeModel("a", 6), FakeModel("b", 6)
+    arb.register(a)
+    arb.register(b)
+    async with await arb.acquire(WorkloadNeed(required_models=("a",))):
+        pass  # a idle+loaded; accounting=10 free, driver=4 free
+    async with await arb.acquire(WorkloadNeed(required_models=("b",))):
+        assert a.unload_calls == 1  # driver figure (4<6) forced the eviction
 
 
 async def test_unknown_required_model_raises():
@@ -170,10 +235,9 @@ async def test_unknown_required_model_raises():
 
 async def test_transient_reservation_is_held_then_released():
     arb = _arbiter()
-    lease = await arb.acquire(WorkloadNeed(transient_bytes=4 * GB))
-    assert arb.transient_reserved_bytes == 4 * GB
-    async with lease:
+    async with await arb.acquire(WorkloadNeed(transient_bytes=4 * GB)) as lease:
         assert arb.transient_reserved_bytes == 4 * GB
+        assert not lease._released
     assert arb.transient_reserved_bytes == 0
 
 
@@ -185,12 +249,46 @@ async def test_lease_release_is_idempotent():
     assert arb.transient_reserved_bytes == 0
 
 
+async def test_dropped_lease_is_released_by_del_backstop():
+    # S3: a lease that is never entered/released must not permanently leak.
+    arb = _arbiter()
+    m = FakeModel("m", 6)
+    arb.register(m)
+    lease = await arb.acquire(WorkloadNeed(required_models=("m",), transient_bytes=2 * GB))
+    assert arb.transient_reserved_bytes == 2 * GB
+    assert m.is_busy
+    del lease
+    gc.collect()
+    assert arb.transient_reserved_bytes == 0  # backstop released the reservation
+    assert not m.is_busy                       # and the residency hold
+
+
 async def test_transient_reservation_forces_eviction():
-    # A transient need (e.g. NVENC) must be able to evict a resident model.
     arb = _arbiter(probe=FakeProbe(total_gb=10))
     resident = FakeModel("resident", 6)
     arb.register(resident)
-    await arb.acquire(WorkloadNeed(required_models=("resident",)))  # 6GB resident, 4 free
+    async with await arb.acquire(WorkloadNeed(required_models=("resident",))):
+        pass  # resident idle+loaded, 4GB free
     async with await arb.acquire(WorkloadNeed(transient_bytes=6 * GB)):
         assert resident.unload_calls == 1  # evicted to fit the transient workload
         assert arb.transient_reserved_bytes == 6 * GB
+
+
+async def test_rebind_via_registry_keeps_accounting_consistent():
+    # F5 at the arbiter level: a rebound resident is unloaded and not double-counted.
+    from concurrent.futures import ThreadPoolExecutor
+    from gpu_server.orchestrator.resident_model import ResidentModel
+
+    ex = ThreadPoolExecutor(max_workers=1)
+    try:
+        m = ResidentModel("whisper", 6 * GB, ex, load_fn=lambda: None, unload_fn=lambda: None)
+        arb = _arbiter()
+        arb.register(m)
+        async with await arb.acquire(WorkloadNeed(required_models=("whisper",))):
+            pass
+        assert "whisper" in arb.loaded_keys()
+        # Simulate stuck-timeout recovery: rebind resets residency to unloaded.
+        m.rebind(ex, load_fn=lambda: None, unload_fn=lambda: None)
+        assert arb.loaded_keys() == []  # no phantom "loaded" entry
+    finally:
+        ex.shutdown(wait=True)

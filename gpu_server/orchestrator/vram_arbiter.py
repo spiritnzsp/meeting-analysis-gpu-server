@@ -112,13 +112,33 @@ class VramArbiter:
         async with self._admission_lock:
             for key in need.required_models:
                 await self._ensure_loaded(key, protect)
-            if need.transient_bytes:
-                await self._make_room(need.transient_bytes, protect)
-                self._transient_reserved += need.transient_bytes
+            # Engage a residency hold on each required model so a LATER admission
+            # cannot evict it while this job is still using it (S1). The hold is
+            # released by the lease. Under the admission lock the just-loaded,
+            # protected models cannot be mid-eviction, so begin_operation
+            # succeeds; roll back on the unexpected failure so no partial hold
+            # leaks. Holds are taken BEFORE transient make_room so a transient
+            # eviction pass can never pick a required model.
+            held: list = []
+            try:
+                for key in dict.fromkeys(need.required_models):
+                    model = self._registry[key].model
+                    if not model.begin_operation():
+                        raise RuntimeError(
+                            f"could not hold required model '{key}' for the job"
+                        )
+                    held.append(model)
+                if need.transient_bytes:
+                    await self._make_room(need.transient_bytes, protect)
+                    self._transient_reserved += need.transient_bytes
+            except BaseException:
+                for model in held:
+                    model.end_operation()
+                raise
             now = self._clock()
             for key in need.required_models:
                 self._registry[key].last_used = now
-        return GpuLease(self, need)
+        return GpuLease(self, need, held)
 
     async def _ensure_loaded(self, key: str, protect: set[str]) -> None:
         entry = self._registry[key]
@@ -147,24 +167,34 @@ class VramArbiter:
             return
         shortfall = budget.total_bytes if aggressive else budget.shortfall_bytes(need_bytes)
 
+        # Reserve every *evictable* resident up front (loaded, unprotected, and
+        # idle). try_reserve_for_eviction atomically excludes busy/held models,
+        # so the policy only ever chooses among models we can actually free — a
+        # busy LRU model can no longer shadow a freeable newer one. Reservations
+        # not chosen as victims are cancelled below, leaving them untouched.
+        reserved: list[tuple[str, _RegistryEntry]] = []
+        for key, entry in self._registry.items():
+            if key in protect or not entry.model.is_loaded():
+                continue
+            if entry.model.try_reserve_for_eviction():
+                reserved.append((key, entry))
+
         candidates = [
             EvictionCandidate(
-                key=k,
-                estimated_vram_bytes=e.model.estimated_vram_bytes,
-                last_used=e.last_used,
+                key=key,
+                estimated_vram_bytes=entry.model.estimated_vram_bytes,
+                last_used=entry.last_used,
             )
-            for k, e in self._registry.items()
-            if k not in protect and e.model.is_loaded()
+            for key, entry in reserved
         ]
-        victim_keys = self._policy.select_victims(candidates, shortfall)
+        victim_keys = set(self._policy.select_victims(candidates, shortfall))
 
-        for vkey in victim_keys:
-            model = self._registry[vkey].model
-            # Skip a model that is busy or already being evicted; we can only
-            # unload one we can atomically reserve as idle.
-            if model.try_reserve_for_eviction():
-                logger.info(f"Evicting '{vkey}' to free VRAM for a pending workload")
-                await model.unload()
+        for key, entry in reserved:
+            if key in victim_keys:
+                logger.info(f"Evicting '{key}' to free VRAM for a pending workload")
+                await entry.model.unload()
+            else:
+                entry.model.cancel_eviction_reservation()
 
     def _current_budget(self) -> VramBudget:
         snap = self._probe.snapshot()
@@ -200,13 +230,20 @@ class VramArbiter:
 
 
 class GpuLease:
-    """Held for the duration of a job's GPU work. Releasing frees the transient
-    reservation; resident models stay loaded (that is the point of residency).
-    Release is synchronous and idempotent so it is cancellation-safe."""
+    """Held for the duration of a job's GPU work. Releasing ends the residency
+    hold on the required models (making them evictable again) and frees the
+    transient reservation; the models stay LOADED (that is the point of
+    residency). Release is synchronous and idempotent so it is cancellation-safe.
 
-    def __init__(self, arbiter: VramArbiter, need: WorkloadNeed):
+    MUST be used as an async context manager — ``async with await
+    arbiter.acquire(...)`` — so release always runs. The ``__del__`` backstop
+    only guards against a dropped lease leaking a hold/reservation; it is not a
+    substitute for the context manager (GC timing is not deterministic)."""
+
+    def __init__(self, arbiter: VramArbiter, need: WorkloadNeed, held_models: list):
         self._arbiter = arbiter
         self._need = need
+        self._held_models = list(held_models)
         self._released = False
 
     async def __aenter__(self) -> "GpuLease":
@@ -220,4 +257,20 @@ class GpuLease:
         if self._released:
             return
         self._released = True
+        for model in self._held_models:
+            model.end_operation()
         self._arbiter._release_transient(self._need.transient_bytes)
+
+    def __del__(self):
+        # Backstop only: a correctly-used lease is already released. Warn and
+        # release so a dropped/never-entered lease cannot permanently leak a
+        # residency hold or transient reservation (S3).
+        if not self._released:
+            try:
+                logger.warning(
+                    "GpuLease was garbage-collected without release(); use "
+                    "'async with await arbiter.acquire(...)'. Releasing now."
+                )
+                self.release()
+            except Exception:
+                pass
