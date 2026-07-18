@@ -111,78 +111,112 @@ class VramArbiter:
         Callers should invoke this OUTSIDE any per-request processing timeout
         (F4): time spent waiting here for another job's VRAM is not the job's
         own GPU time.
+
+        Backpressure (P0-3): when the job cannot fit ONLY because the VRAM it
+        needs is currently HELD by another job's active lease, this WAITS for a
+        release and retries rather than OOM-failing — two workloads that cannot
+        co-reside serialize instead of one hard-failing. Crucially the wait
+        happens with the admission lock RELEASED, so a concurrent admission — or
+        a worker's stuck-recovery running under admission_barrier() — is not
+        blocked behind the waiter (BLOCKER-1). Bounded by busy_wait_seconds; past
+        the deadline a final forced attempt admits even if the load may OOM.
         """
         unknown = [k for k in need.required_models if k not in self._registry]
         if unknown:
             raise KeyError(f"Unknown required model(s): {unknown}")
 
         protect = set(need.required_models)
-        async with self._admission_lock:
-            for key in need.required_models:
-                await self._ensure_loaded(key, protect)
-            # Engage a residency hold on each required model so a LATER admission
-            # cannot evict it while this job is still using it (S1). The hold is
-            # released by the lease. Under the admission lock the just-loaded,
-            # protected models cannot be mid-eviction, so begin_operation
-            # succeeds; roll back on the unexpected failure so no partial hold
-            # leaks. Holds are taken BEFORE transient make_room so a transient
-            # eviction pass can never pick a required model.
-            held: list = []
-            try:
-                for key in dict.fromkeys(need.required_models):
-                    model = self._registry[key].model
-                    if not model.begin_operation():
-                        raise RuntimeError(
-                            f"could not hold required model '{key}' for the job"
-                        )
-                    held.append(model)
-                if need.transient_bytes:
-                    await self._make_room(need.transient_bytes, protect)
-                    self._transient_reserved += need.transient_bytes
-            except BaseException:
-                for model in held:
-                    model.end_operation()
-                raise
-            now = self._clock()
-            for key in need.required_models:
-                self._registry[key].last_used = now
-        return GpuLease(self, need, held)
-
-    async def _ensure_loaded(self, key: str, protect: set[str]) -> None:
-        entry = self._registry[key]
-        if entry.model.is_loaded():
-            return
-        need_bytes = entry.model.estimated_vram_bytes
-
-        # Make room. If it doesn't fit only because the VRAM is HELD by another
-        # job's active lease, wait for a release and retry rather than
-        # OOM-failing this job (P0-3): two workloads that can't co-reside on the
-        # card serialize instead of one hard-failing. Bounded by
-        # busy_wait_seconds so a stuck holder can't wedge admission forever. If
-        # the shortfall is NOT due to a held model (genuinely absent VRAM), fall
-        # straight through to the OOM-tolerant load below.
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self._busy_wait_seconds
         while True:
-            self._release_event.clear()  # clear BEFORE checking (no lost wakeup)
-            await self._make_room(need_bytes, protect)
-            if self._current_budget().can_fit(need_bytes):
-                break
-            if not self._has_held_evictable(protect):
-                break  # nothing more to free — let the load try (may OOM)
+            # Clear BEFORE the guarded attempt: a release that fires after this
+            # point but before we park re-signals the event so our wait returns
+            # immediately (no lost wakeup); a release BEFORE the clear already had
+            # its op_count effect applied and is visible to _try_admit under the
+            # lock.
+            self._release_event.clear()
+            force = loop.time() >= deadline
+            async with self._admission_lock:
+                lease = await self._try_admit(need, protect, force=force)
+            if lease is not None:
+                return lease
+            if force:  # a forced attempt must admit-or-raise, never block
+                raise RuntimeError("admission force attempt returned no lease")
             remaining = deadline - loop.time()
             if remaining <= 0:
-                logger.warning(
-                    f"Timed out waiting {self._busy_wait_seconds:.0f}s for VRAM "
-                    f"to load '{key}'; attempting load anyway"
-                )
-                break
-            logger.info(f"Waiting for a held model to release before loading '{key}'")
+                continue  # deadline passed → next iteration forces
+            logger.info("Admission blocked on a held model; waiting for a release")
             try:
                 await asyncio.wait_for(self._release_event.wait(), timeout=remaining)
             except asyncio.TimeoutError:
-                break
+                pass  # next iteration forces
 
+    async def _try_admit(
+        self, need: WorkloadNeed, protect: set[str], force: bool
+    ) -> Optional["GpuLease"]:
+        """One atomic admission attempt. PRECONDITION: holds _admission_lock and
+        NEVER waits/sleeps while holding it. Loads and HOLDS every required model
+        and reserves the transient. Returns a lease on success; returns None if
+        blocked ONLY because required VRAM is HELD by another lease (the caller
+        should release the lock, wait for a release, and retry). Raises on genuine
+        failure. When force=True it never returns None — it admits even if a load
+        may OOM (the deadline has passed).
+
+        Holds are taken INTERLEAVED with loading (each required model is held
+        immediately after it is loaded), not in a second pass: once the caller may
+        drop the lock to wait, an already-loaded-but-unheld required model could
+        be evicted by a concurrent admission (TOCTOU). Holding it as soon as it is
+        resident protects it across any later lock-free wait.
+        """
+        keys = tuple(dict.fromkeys(need.required_models))
+        held: list = []
+        try:
+            for key in keys:
+                entry = self._registry[key]
+                if not entry.model.is_loaded():
+                    if not await self._prepare_load(key, protect, force):
+                        for m in held:
+                            m.end_operation()
+                        return None  # blocked on a held victim
+                    await self._load_with_oom_retry(key, protect)
+                if not entry.model.begin_operation():
+                    raise RuntimeError(
+                        f"could not hold required model '{key}' for the job"
+                    )
+                held.append(entry.model)
+            if need.transient_bytes:
+                if not await self._prepare_transient(need.transient_bytes, protect, force):
+                    for m in held:
+                        m.end_operation()
+                    return None  # blocked on a held victim
+                self._transient_reserved += need.transient_bytes
+            now = self._clock()
+            for key in keys:
+                self._registry[key].last_used = now
+            lease = GpuLease(self, need, held)
+            held = None  # ownership transferred to the lease
+            return lease
+        except BaseException:
+            if held:
+                for m in held:
+                    m.end_operation()
+            raise
+
+    async def _prepare_load(self, key: str, protect: set[str], force: bool) -> bool:
+        """Make room for a required model. Returns True if the caller should
+        proceed to load it (it fits now, is forced, or nothing more can be freed
+        by waiting so the OOM-tolerant load should just try); False if it does NOT
+        fit and the only thing in the way is VRAM HELD by another lease (wait)."""
+        need_bytes = self._registry[key].model.estimated_vram_bytes
+        await self._make_room(need_bytes, protect, aggressive=force)
+        if force or self._current_budget().can_fit(need_bytes):
+            return True
+        if self._has_held_evictable(protect):
+            return False  # waiting for a release could free room
+        return True  # genuinely absent VRAM — let the OOM-tolerant load try
+
+    async def _load_with_oom_retry(self, key: str, protect: set[str]) -> None:
+        entry = self._registry[key]
         try:
             await entry.model.load()
         except BaseException as exc:  # noqa: BLE001 - re-raised unless OOM
@@ -193,8 +227,33 @@ class VramArbiter:
             logger.warning(
                 f"Load of '{key}' hit OOM; evicting aggressively and retrying"
             )
-            await self._make_room(need_bytes, protect, aggressive=True)
+            await self._make_room(entry.model.estimated_vram_bytes, protect, aggressive=True)
             await entry.model.load()
+
+    async def _prepare_transient(
+        self, transient_bytes: int, protect: set[str], force: bool
+    ) -> bool:
+        """Make room for a transient reservation (e.g. an NVENC encode). Same
+        fits/blocked semantics as _prepare_load (BLOCKER-2 — the transient path
+        used to bypass backpressure and over-admit past held models): True →
+        reserve (fits, forced, or genuinely-absent VRAM), False → blocked on a
+        held model so the caller waits and retries."""
+        await self._make_room(transient_bytes, protect, aggressive=force)
+        if force or self._current_budget().can_fit(transient_bytes):
+            return True
+        if self._has_held_evictable(protect):
+            return False
+        return True
+
+    def admission_barrier(self):
+        """Exclusive-admission async context manager: while held, no acquire()
+        can run its critical section. Used by a worker's stuck-recovery to
+        recreate a processor (swap its shared executor) without a concurrent
+        eviction pass touching a sibling resident on that executor. The arbiter
+        exposes only the mutual exclusion — it does NOT orchestrate the recreate,
+        so it stays executor/CUDA-agnostic. Safe against the P0-3 waiter because
+        that waiter releases this lock while parked (see acquire)."""
+        return self._admission_lock
 
     def _has_held_evictable(self, protect: set[str]) -> bool:
         """Whether some loaded, unprotected resident is currently HELD by a lease
