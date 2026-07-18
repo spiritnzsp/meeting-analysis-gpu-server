@@ -55,9 +55,11 @@ class VideoWorker:
     - Upload timeout enforcement
     """
 
-    def __init__(self, config: Config, queue: QueueManager):
+    def __init__(self, config: Config, queue: QueueManager, arbiter=None):
         self.config = config
         self.queue = queue
+        # The arbiter reserves the transient NVENC VRAM per encode (wired in D2.3).
+        self._arbiter = arbiter
 
         self._encoder: Optional[VideoEncoderProcessor] = None
         self._pending_uploads: Dict[str, TempVideoFile] = {}

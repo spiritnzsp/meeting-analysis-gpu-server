@@ -1,11 +1,22 @@
 """
 GPU Processing Worker
 
-Orchestrates Whisper and PyAnnote processing for queued requests.
+Orchestrates Whisper and PyAnnote processing for queued requests, gated through
+the VRAM arbiter so audio serializes/evicts around the LLM and video workloads on
+a single card instead of independently OOMing.
+
+Each request runs under an arbiter lease acquired OUTSIDE the per-request
+processing timeout (F4): the lease keeps the request's required models resident
+for the whole job (a concurrent LLM admission cannot evict them mid-transcription)
+and, conversely, admitting this job may evict the idle LLM to make room. On a
+processing timeout the processors are cancelled and drained WHILE STILL HOLDING
+THE LEASE; a wedged processor is recreated through its ResidentProcessorHandle
+(rebind, under the arbiter's admission barrier) so the arbiter registry never
+desyncs.
 """
 import asyncio
 import time
-from typing import Optional, Callable, Awaitable
+from typing import Optional, List
 
 from .config import Config
 from .queue_manager import QueueManager, QueuedRequest
@@ -14,6 +25,11 @@ from .protocol import (
     TranscriptSegment, DiarizationSegment, SpeakerEmbedding, ErrorMessage
 )
 from .processors import WhisperProcessor, PyAnnoteProcessor, ProcessorCancelled
+from .processors.whisper_processor import WHISPER_MODEL_KEY
+from .processors.pyannote_processor import PYANNOTE_MODEL_KEY, PYANNOTE_EMBEDDING_KEY
+from .orchestrator import (
+    VramArbiter, WorkloadNeed, ResidentModel, ResidentProcessorHandle,
+)
 from .utils.temp_file import cleanup_orphaned_temp_files
 from .logging_config import (
     get_logger, set_request_context, clear_request_context,
@@ -27,23 +43,32 @@ class GPUWorker:
     """
     GPU processing worker.
 
-    Continuously processes requests from the queue using
-    Whisper for transcription and PyAnnote for diarization.
+    Continuously processes requests from the queue using Whisper for
+    transcription and PyAnnote for diarization, gated through the VRAM arbiter.
     """
 
-    def __init__(self, config: Config, queue: QueueManager):
+    def __init__(self, config: Config, queue: QueueManager, arbiter: VramArbiter):
         """
         Initialize the GPU worker.
 
         Args:
             config: Server configuration
             queue: Request queue manager
+            arbiter: VRAM admission arbiter (shared across all workloads)
         """
         self.config = config
         self.queue = queue
+        self._arbiter = arbiter
 
-        self._whisper: Optional[WhisperProcessor] = None
-        self._pyannote: Optional[PyAnnoteProcessor] = None
+        # The processors are owned by ResidentProcessorHandles so a stuck-timeout
+        # recovery can recreate the underlying processor and rebind its arbiter
+        # residents as one transaction, keeping the registry identity stable (F5).
+        self._whisper_handle = ResidentProcessorHandle(
+            lambda: WhisperProcessor(config.whisper)
+        )
+        self._pyannote_handle = ResidentProcessorHandle(
+            lambda: PyAnnoteProcessor(config.pyannote)
+        )
 
         self._running = False
         self._current_request: Optional[str] = None
@@ -51,6 +76,21 @@ class GPUWorker:
         # Exponential backoff for error recovery (prevents log flooding)
         self._error_backoff_seconds: float = 1.0
         self._max_error_backoff_seconds: float = 60.0
+
+    def residents(self) -> List[ResidentModel]:
+        """The arbiter residents this worker owns (whisper + the two pyannote
+        models). The server registers these synchronously at startup (F9)."""
+        return self._whisper_handle.residents() + self._pyannote_handle.residents()
+
+    # The current processor instances, resolved through the handles so a
+    # stuck-recovery swap is transparent to _process_request. Read-only.
+    @property
+    def _whisper(self) -> WhisperProcessor:
+        return self._whisper_handle.processor
+
+    @property
+    def _pyannote(self) -> PyAnnoteProcessor:
+        return self._pyannote_handle.processor
 
     async def start(self):
         """Start the worker processing loop."""
@@ -69,117 +109,18 @@ class GPUWorker:
         if orphans_cleaned > 0:
             logger.info(f"Cleaned {orphans_cleaned} orphaned temp files from previous runs")
 
-        # Initialize processors (lazy load models on first use)
-        self._whisper = WhisperProcessor(self.config.whisper)
-        self._pyannote = PyAnnoteProcessor(self.config.pyannote)
-
         self._running = True
         logger.info("GPU Worker started and ready for requests")
 
         while self._running:
             try:
-                # Wait for next request
                 queued = await self.queue.wait_for_request()
 
                 if queued.cancelled:
-                    set_request_context(request_id=queued.request.request_id)
-                    # Check if it was a timeout vs user cancellation
-                    if queued.timeout_expired:
-                        logger.info(
-                            LogEvents.REQUEST_TIMEOUT,
-                            data={'stage': 'queue', 'reason': 'queue_timeout'}
-                        )
-                        # Notify client of timeout
-                        try:
-                            await queued.websocket.send(ErrorMessage(
-                                request_id=queued.request.request_id,
-                                error="Request timed out while waiting in queue",
-                                recoverable=True,
-                                error_code="QUEUE_TIMEOUT",
-                            ).to_json())
-                        except Exception as e:
-                            logger.warning(f"Failed to send timeout error: {e}")
-                    else:
-                        logger.info(LogEvents.REQUEST_CANCELLED, data={'stage': 'queue'})
-                    clear_request_context()
+                    self._handle_queue_cancelled(queued)
                     continue
 
-                # Process the request with timeout
-                processing_timeout = self.config.queue.processing_timeout
-                try:
-                    await asyncio.wait_for(
-                        self._process_request(queued),
-                        timeout=processing_timeout
-                    )
-                except asyncio.TimeoutError:
-                    request_id = queued.request.request_id
-                    set_request_context(request_id=request_id)
-                    logger.error(
-                        LogEvents.REQUEST_TIMEOUT,
-                        data={
-                            'stage': 'processing',
-                            'timeout_seconds': processing_timeout,
-                        }
-                    )
-
-                    # Cancel processors to stop ongoing GPU operations
-                    if self._whisper:
-                        self._whisper.cancel(request_id)
-                    if self._pyannote:
-                        self._pyannote.cancel(request_id)
-
-                    # Wait for GPU operations to complete before continuing
-                    # This prevents race conditions where next request starts
-                    # while GPU is still busy with the timed-out request
-                    logger.info("Waiting for GPU operations to complete...")
-                    wait_timeout = 30.0  # Max time to wait for GPU to finish
-
-                    # Wait for Whisper processor, recover if stuck
-                    if self._whisper:
-                        whisper_idle = await self._whisper.wait_for_idle(wait_timeout)
-                        if not whisper_idle:
-                            logger.error(
-                                "Whisper processor stuck after timeout, recreating processor"
-                            )
-                            try:
-                                self._whisper.shutdown()
-                            except Exception as e:
-                                logger.warning(f"Error shutting down stuck Whisper processor: {e}")
-                            self._whisper = WhisperProcessor(self.config.whisper)
-                            logger.info("Whisper processor recreated successfully")
-
-                    # Wait for PyAnnote processor, recover if stuck
-                    if self._pyannote:
-                        pyannote_idle = await self._pyannote.wait_for_idle(wait_timeout)
-                        if not pyannote_idle:
-                            logger.error(
-                                "PyAnnote processor stuck after timeout, recreating processor"
-                            )
-                            try:
-                                self._pyannote.shutdown()
-                            except Exception as e:
-                                logger.warning(f"Error shutting down stuck PyAnnote processor: {e}")
-                            self._pyannote = PyAnnoteProcessor(self.config.pyannote)
-                            logger.info("PyAnnote processor recreated successfully")
-
-                    logger.info("GPU operations completed, ready for next request")
-
-                    # Send timeout error to client
-                    try:
-                        await queued.websocket.send(ErrorMessage(
-                            request_id=request_id,
-                            error=f"Processing timed out after {processing_timeout} seconds",
-                            recoverable=False,
-                            error_code="PROCESSING_TIMEOUT",
-                        ).to_json())
-                    except Exception as e:
-                        logger.warning(f"Failed to send processing timeout error: {e}")
-
-                    # Clean up GPU memory after timeout
-                    self._cleanup_gpu_memory()
-
-                    self._current_request = None
-                    clear_request_context()
+                await self._serve(queued)
 
                 # Reset error backoff on successful request processing
                 self._error_backoff_seconds = 1.0
@@ -203,22 +144,158 @@ class GPUWorker:
 
         logger.info("GPU Worker stopped")
 
+    def _handle_queue_cancelled(self, queued: QueuedRequest) -> None:
+        set_request_context(request_id=queued.request.request_id)
+        if queued.timeout_expired:
+            logger.info(
+                LogEvents.REQUEST_TIMEOUT,
+                data={'stage': 'queue', 'reason': 'queue_timeout'}
+            )
+            asyncio.ensure_future(self._send_error(
+                queued.websocket, queued.request.request_id,
+                "Request timed out while waiting in queue",
+                recoverable=True, error_code="QUEUE_TIMEOUT",
+            ))
+        else:
+            logger.info(LogEvents.REQUEST_CANCELLED, data={'stage': 'queue'})
+        clear_request_context()
+
+    def _workload_need(self, request: ProcessRequest) -> WorkloadNeed:
+        """Derive the required models from what the request actually asks for
+        (request-derived, not hardcoded): transcribe→whisper, diarize→pyannote,
+        extract_embeddings (only meaningful alongside diarize)→pyannote_embedding.
+        This pins only the VRAM the job will use, which is what makes the two
+        pyannote residents pay off."""
+        keys: list[str] = []
+        if request.options.transcribe:
+            keys.append(WHISPER_MODEL_KEY)
+        if request.options.diarize:
+            keys.append(PYANNOTE_MODEL_KEY)
+            if request.options.extract_embeddings:
+                keys.append(PYANNOTE_EMBEDDING_KEY)
+        return WorkloadNeed(required_models=tuple(keys))
+
+    async def _serve(self, queued: QueuedRequest) -> None:
+        """Acquire the VRAM lease (outside the timeout), process under it, and be
+        the SOLE sender of the result. On timeout, recover while still holding the
+        lease, then send the outcome."""
+        request = queued.request
+        websocket = queued.websocket
+        need = self._workload_need(request)
+        processing_timeout = self.config.queue.processing_timeout
+
+        try:
+            async with await self._arbiter.acquire(need):
+                task = asyncio.ensure_future(self._process_request(queued))
+                try:
+                    # shield so the timeout does not cancel the coroutine (a
+                    # run_in_executor job can't be cancelled anyway); on timeout
+                    # we cancel+drain+recover explicitly, still holding the lease.
+                    result = await asyncio.wait_for(
+                        asyncio.shield(task), timeout=processing_timeout
+                    )
+                except asyncio.TimeoutError:
+                    result = await self._recover_from_timeout(queued, task)
+            # Lease released here — AFTER any recovery, so no concurrent admission
+            # can evict a model mid-teardown.
+            if result is not None:
+                await self._send_result(websocket, request.request_id, result)
+        except Exception as e:
+            # acquire() can raise (unknown model, forced-load OOM, hold failure);
+            # emit a failure result rather than letting the client hang (F-D).
+            logger.error(f"Audio admission/processing failed: {e}", exc_info=True)
+            await self._send_error(
+                websocket, request.request_id, "Processing failed",
+                recoverable=False, error_code="PROCESSING_FAILED",
+            )
+
+    async def _recover_from_timeout(
+        self, queued: QueuedRequest, task: asyncio.Future
+    ) -> Optional[ProcessingResult]:
+        """A processing timeout fired. Cancel the in-flight work, drain it, and
+        recreate any wedged processor — all WHILE STILL HOLDING THE LEASE (the
+        required models stay held, op_count>0, so a concurrent admission cannot
+        reserve/evict the model being torn down). Returns the request's result if
+        the drain produced one, else None (caller sends a timeout error)."""
+        request_id = queued.request.request_id
+        set_request_context(request_id=request_id)
+        logger.error(
+            LogEvents.REQUEST_TIMEOUT,
+            data={'stage': 'processing',
+                  'timeout_seconds': self.config.queue.processing_timeout}
+        )
+
+        # Flag cancellation; the executor jobs unwind at the next _check_cancelled.
+        self._whisper.cancel(request_id)
+        self._pyannote.cancel(request_id)
+
+        wait_timeout = 30.0
+        whisper_idle = await self._whisper.wait_for_idle(wait_timeout)
+        pyannote_idle = await self._pyannote.wait_for_idle(wait_timeout)
+
+        # Recreate any WEDGED processor through its handle. The recreate runs
+        # under the admission barrier so no concurrent eviction pass touches its
+        # shared executor mid-swap (CB2); the barrier is reachable because a
+        # parked P0-3 waiter releases the admission lock (BLOCKER-1).
+        if not whisper_idle:
+            logger.error("Whisper processor stuck after timeout, recreating")
+            async with self._arbiter.admission_barrier():
+                await self._whisper_handle.recreate()
+        if not pyannote_idle:
+            logger.error("PyAnnote processor stuck after timeout, recreating")
+            async with self._arbiter.admission_barrier():
+                await self._pyannote_handle.recreate()
+
+        result: Optional[ProcessingResult] = None
+        if whisper_idle and pyannote_idle:
+            # Processors honoured the cancel; the task caught ProcessorCancelled
+            # and is producing a (failed) result. Collect it — it is the outcome.
+            try:
+                result = await asyncio.wait_for(task, timeout=5.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                result = None
+        else:
+            # A processor was recreated; the task's executor future is on the dead
+            # executor. Detach it.
+            task.cancel()
+            try:
+                await task
+            except BaseException:
+                pass
+
+        self._cleanup_gpu_memory()
+        self._current_request = None
+        clear_request_context()
+
+        if result is None:
+            # F-C: only synthesise a timeout error when the drain produced no real
+            # result (a drain that finished cleanly returned one above).
+            return ProcessingResult(
+                request_id=request_id,
+                success=False,
+                error_message=(
+                    f"Processing timed out after "
+                    f"{self.config.queue.processing_timeout} seconds"
+                ),
+            )
+        return result
+
     async def stop(self):
         """Stop the worker."""
         self._running = False
 
         # Shutdown processors (unloads models and shuts down executors)
-        if self._whisper:
-            self._whisper.shutdown()
-        if self._pyannote:
-            self._pyannote.shutdown()
+        self._whisper.shutdown()
+        self._pyannote.shutdown()
 
-    async def _process_request(self, queued: QueuedRequest):
+    async def _process_request(self, queued: QueuedRequest) -> ProcessingResult:
         """
-        Process a single request.
+        Process a single request and RETURN its result (the caller, _serve, owns
+        sending it — so there is exactly one sender per request, uniform across
+        workers). Progress messages are still sent here as work proceeds.
 
-        Args:
-            queued: The queued request to process
+        The required models are guaranteed resident by the arbiter lease the
+        caller holds; the processors assert-resident rather than self-load.
         """
         request = queued.request
         websocket = queued.websocket
@@ -226,7 +303,6 @@ class GPUWorker:
         self._current_request = request.request_id
         start_time = time.time()
 
-        # Set request context for all logging in this method
         set_request_context(
             request_id=request.request_id,
             meeting_name=request.meeting_name,
@@ -246,12 +322,11 @@ class GPUWorker:
         consecutive_failures = 0
         max_consecutive_failures = 3
 
-        # Create progress callback with early termination support
         async def send_progress(msg: ProgressMessage):
             nonlocal consecutive_failures
             try:
                 await websocket.send(msg.to_json())
-                consecutive_failures = 0  # Reset on success
+                consecutive_failures = 0
             except Exception as e:
                 consecutive_failures += 1
                 if consecutive_failures >= max_consecutive_failures:
@@ -259,11 +334,8 @@ class GPUWorker:
                         f"Client appears disconnected ({consecutive_failures} consecutive failures), "
                         f"cancelling processing for {request.request_id}"
                     )
-                    # Cancel the processors to stop wasting GPU resources
-                    if self._whisper:
-                        self._whisper.cancel(request.request_id)
-                    if self._pyannote:
-                        self._pyannote.cancel(request.request_id)
+                    self._whisper.cancel(request.request_id)
+                    self._pyannote.cancel(request.request_id)
                 else:
                     logger.warning(f"Failed to send progress ({consecutive_failures}/{max_consecutive_failures}): {e}")
 
@@ -349,7 +421,6 @@ class GPUWorker:
                         meeting_id=request.request_id,
                         progress_callback=send_progress,
                         request_id=request.request_id,
-                        hf_token=request.options.hf_token,
                     )
 
                     logger.info(
@@ -376,7 +447,6 @@ class GPUWorker:
             if request.options.diarize and not diarization_segments:
                 warnings.append("Diarization requested but produced no speaker segments")
             if request.options.extract_embeddings and request.options.diarize and diarization_segments and not speaker_embeddings:
-                # Only warn if diarization succeeded but embedding extraction failed
                 warnings.append("Embedding extraction requested but produced no embeddings")
 
             result = ProcessingResult(
@@ -410,7 +480,6 @@ class GPUWorker:
             )
 
         except ProcessorCancelled:
-            # Processing was cancelled (timeout or user request)
             processing_time = time.time() - start_time
             logger.info(
                 LogEvents.REQUEST_CANCELLED,
@@ -440,7 +509,7 @@ class GPUWorker:
             result = ProcessingResult(
                 request_id=request.request_id,
                 success=False,
-                error_message="Processing failed",  # Don't leak internal details to clients
+                error_message="Processing failed",  # Don't leak internal details
                 processing_time_seconds=processing_time,
             )
 
@@ -448,31 +517,45 @@ class GPUWorker:
             self._current_request = None
             clear_request_context()
 
-        # Send result
+        return result
+
+    async def _send_result(self, websocket, request_id: str, result: ProcessingResult) -> None:
+        """Send the final progress + result to the client (the sole send site)."""
         try:
-            await send_progress(ProgressMessage(
-                request_id=request.request_id,
+            await websocket.send(ProgressMessage(
+                request_id=request_id,
                 stage=ProcessingStage.COMPLETE if result.success else ProcessingStage.FAILED,
                 percent=100,
                 message="Complete" if result.success else result.error_message,
-            ))
+            ).to_json())
             await websocket.send(result.to_json())
         except Exception as e:
             logger.error(f"Failed to send result: {e}")
 
+    @staticmethod
+    async def _send_error(websocket, request_id: str, error: str,
+                          recoverable: bool = False,
+                          error_code: str = "PROCESSING_FAILED") -> None:
+        try:
+            await websocket.send(ErrorMessage(
+                request_id=request_id,
+                error=error,
+                recoverable=recoverable,
+                error_code=error_code,
+            ).to_json())
+        except Exception as e:
+            logger.warning(f"Failed to send error message: {e}")
+
     def _cleanup_gpu_memory(self):
         """
-        Force GPU memory cleanup.
-
-        Called after processing timeouts to free any stuck GPU memory.
-        Note: This may not cancel in-flight operations, but will release
-        memory after they complete.
+        Force GPU memory cleanup after a timeout. May not cancel in-flight
+        operations but releases cache after they complete.
         """
         try:
             import torch
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-                torch.cuda.synchronize()  # Wait for any pending GPU ops
+                torch.cuda.synchronize()
                 logger.info("GPU memory cache cleared after timeout")
         except ImportError:
             pass

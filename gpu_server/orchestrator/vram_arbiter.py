@@ -100,6 +100,17 @@ class VramArbiter:
         the SAME model object (keeping identity) rather than re-register."""
         self._registry[model.key] = _RegistryEntry(model=model)
 
+    def prewarm(self) -> None:
+        """Take one probe reading to force the (blocking, CUDA-context-creating)
+        first ``mem_get_info`` off the live admission path (F9). Blocking — call
+        from an executor, not the event loop. Best-effort: swallows a missing
+        torch / unavailable CUDA so a CPU-only box still starts."""
+        try:
+            self._probe.snapshot()
+            logger.info("VRAM arbiter probe pre-warmed")
+        except Exception as e:  # noqa: BLE001 - startup best-effort
+            logger.warning(f"VRAM arbiter probe pre-warm skipped: {e}")
+
     # --- admission ---------------------------------------------------------
 
     async def acquire(self, need: WorkloadNeed) -> "GpuLease":

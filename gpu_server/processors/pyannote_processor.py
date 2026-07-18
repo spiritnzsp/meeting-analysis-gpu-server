@@ -50,10 +50,6 @@ class PyAnnoteProcessor(BaseProcessor):
         self._pipeline = None
         self._embedding_model = None
 
-        # Store pre-computed embeddings from diarization (avoids loading separate model)
-        self._last_embeddings: Dict[str, List[tuple]] = {}
-        self._last_speaker_map: Dict[str, str] = {}  # SPEAKER_00 -> Person-1 mapping
-
     @property
     def processor_name(self) -> str:
         return "PyAnnote"
@@ -109,11 +105,6 @@ class PyAnnoteProcessor(BaseProcessor):
         Per-resident eviction goes through _unload_pipeline / _unload_embedding."""
         self._unload_pipeline()
         self._unload_embedding()
-
-    # Keep unload() as a public alias for backward compatibility
-    def unload(self):
-        """Unload models to free GPU memory."""
-        self._unload_resources()
 
     def _ensure_pipeline_sync(self):
         """Load the diarization pipeline if not already loaded (synchronous, runs in executor)."""
@@ -172,13 +163,11 @@ class PyAnnoteProcessor(BaseProcessor):
             logger.error(f"Failed to load PyAnnote pipeline: {e}")
             raise
 
-    def _ensure_embedding_model_sync(self, client_hf_token: Optional[str] = None):
-        """Load the embedding model if not already loaded (synchronous, runs in executor).
-
-        Args:
-            client_hf_token: Optional token from client (used if model not cached).
-                             Once model is downloaded, token is no longer needed.
-        """
+    def _ensure_embedding_model_sync(self):
+        """Load the embedding model if not already loaded (synchronous, runs on
+        the executor via the arbiter's ResidentModel). Uses the server's
+        configured HuggingFace token — the arbiter-driven load has no per-request
+        client token."""
         if self._embedding_model is not None:
             return
 
@@ -193,9 +182,7 @@ class PyAnnoteProcessor(BaseProcessor):
             "pyannote/wespeaker-voxceleb-resnet34-LM",
         ]
 
-        token = client_hf_token or self.config.huggingface_token
-        if client_hf_token:
-            logger.info("Using client-provided HuggingFace token for embedding model")
+        token = self.config.huggingface_token
 
         last_error: Optional[Exception] = None
         for model_name in candidate_models:
@@ -323,18 +310,10 @@ class PyAnnoteProcessor(BaseProcessor):
                 speaker_map[seg.speaker] = f"Person-{len(speaker_map) + 1}"
             seg.speaker = speaker_map[seg.speaker]
 
-        # Store speaker map for embedding key conversion
-        self._last_speaker_map = speaker_map
-
-        # Embeddings are no longer extracted here. Leaving _last_embeddings
-        # empty causes extract_embeddings() to fall through to the
-        # best-segment-per-speaker pass in _extract_embeddings_sync, which
-        # produces one vector per speaker tied to a single known audio
-        # window. Centroid aggregation across all segments tagged with the
-        # same label silently inherits diariser clumping errors and was
-        # the cause of false-positive registry matches against degenerate
-        # mixed-speaker embeddings.
-        self._last_embeddings = {}
+        # Embeddings are extracted in a separate pass (best-segment per speaker)
+        # via _extract_embeddings_sync, not here — centroid aggregation across all
+        # segments tagged with one label inherits diariser clumping errors and was
+        # the cause of false-positive registry matches.
 
         logger.info(f"Diarization complete: {len(segments)} segments, {len(speaker_map)} speakers")
         return segments
@@ -365,15 +344,17 @@ class PyAnnoteProcessor(BaseProcessor):
         self._check_shutdown()
         self._begin_operation()
 
+        # The pipeline is loaded by the arbiter (the caller holds a lease that
+        # requires "pyannote"); no self-load — the arbiter owns loaded-ness.
+        if not self.is_pipeline_loaded():
+            raise RuntimeError(
+                "PyAnnote pipeline is not resident — the arbiter lease must "
+                "require 'pyannote' before diarize()"
+            )
+
         loop = asyncio.get_running_loop()
 
         try:
-            # Load pipeline in executor (blocking operation)
-            await loop.run_in_executor(
-                self._executor,
-                self._ensure_pipeline_sync,
-            )
-
             # Write audio to temp file with robust cleanup
             with TempAudioFile(audio_data, suffix=".opus") as audio_path:
                 try:
@@ -511,7 +492,6 @@ class PyAnnoteProcessor(BaseProcessor):
         meeting_id: str = "",
         progress_callback: Optional[Callable[[ProgressMessage], Awaitable[None]]] = None,
         request_id: str = "",
-        hf_token: Optional[str] = None,
     ) -> List[SpeakerEmbedding]:
         """
         Extract speaker embeddings from audio (non-blocking).
@@ -522,51 +502,30 @@ class PyAnnoteProcessor(BaseProcessor):
             meeting_id: Meeting ID for embedding metadata
             progress_callback: Callback for progress updates
             request_id: Request ID for progress messages
-            hf_token: Optional client HuggingFace token (for first-time model download)
 
         Returns:
             List of SpeakerEmbedding (one per unique speaker)
 
         Raises:
-            RuntimeError: If processor has been shut down
+            RuntimeError: If processor has been shut down or the embedding model
+                is not resident
             ProcessorCancelled: If processing was cancelled
         """
         self._check_shutdown()
 
-        # Check for pre-computed embeddings from diarization (preferred method)
-        if self._last_embeddings:
-            logger.info(f"Using {len(self._last_embeddings)} pre-computed embeddings from diarization")
-            embeddings = []
-            for speaker_label, emb_list in self._last_embeddings.items():
-                for emb_np, start, duration, quality in emb_list:
-                    embeddings.append(SpeakerEmbedding(
-                        speaker_label=speaker_label,
-                        meeting_id=meeting_id,
-                        segment_start=start,
-                        segment_duration=duration,
-                        embedding=emb_np.tolist() if hasattr(emb_np, 'tolist') else list(emb_np),
-                        quality_score=quality,
-                    ))
-            # Clear after use to avoid stale data
-            self._last_embeddings = {}
-            return embeddings
-
-        # No pre-computed embeddings - fall back to loading separate model
-        logger.info("No pre-computed embeddings available, loading embedding model...")
+        # The embedding model is loaded by the arbiter (the caller holds a lease
+        # that requires "pyannote_embedding"); no self-load.
+        if not self.is_embedding_loaded():
+            raise RuntimeError(
+                "PyAnnote embedding model is not resident — the arbiter lease "
+                "must require 'pyannote_embedding' before extract_embeddings()"
+            )
 
         self._begin_operation()
 
         loop = asyncio.get_running_loop()
 
         try:
-            # Load embedding model in executor (blocking operation)
-            # Pass client token for first-time model download
-            from functools import partial
-            await loop.run_in_executor(
-                self._executor,
-                partial(self._ensure_embedding_model_sync, client_hf_token=hf_token),
-            )
-
             # Write audio to temp file with robust cleanup
             with TempAudioFile(audio_data, suffix=".opus") as audio_path:
                 try:

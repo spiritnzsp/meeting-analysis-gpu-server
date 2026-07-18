@@ -80,11 +80,6 @@ class WhisperProcessor(BaseProcessor):
             logger.info("Whisper model unloaded")
             self._empty_cuda_cache()
 
-    # Keep unload() as a public alias for backward compatibility
-    def unload(self):
-        """Unload the model to free GPU memory."""
-        self._unload_resources()
-
     def _load_model_sync(self) -> None:
         """Load the configured Whisper model (blocking; runs on the executor
         thread). Idempotent. Constrained to ``config.model`` — a fixed-key
@@ -198,16 +193,18 @@ class WhisperProcessor(BaseProcessor):
                 f"constrained to config.model='{self.config.model}'"
             )
 
+        # The model is loaded by the arbiter (the caller holds a lease that
+        # requires "whisper"); this processor no longer self-loads — the arbiter
+        # is the single owner of loaded-ness. Fail fast if that contract is broken.
+        if not self.is_loaded():
+            raise RuntimeError(
+                "Whisper model is not resident — the arbiter lease must require "
+                "'whisper' before transcribe()"
+            )
+
         loop = asyncio.get_running_loop()
 
         try:
-            # Load model in executor (blocking operation). Idempotent: when the
-            # arbiter already loaded the resident (D2 gating), this is a no-op.
-            await loop.run_in_executor(
-                self._executor,
-                self._load_model_sync,
-            )
-
             # Write audio to temp file with robust cleanup (faster-whisper needs file path)
             with TempAudioFile(audio_data, suffix=".opus") as audio_path:
                 try:

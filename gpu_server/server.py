@@ -128,13 +128,24 @@ class GPUServer:
         """
         self.config = config
 
-        # Audio queue and worker
+        # VRAM arbiter — the SINGLE admission point for all GPU workloads. Built
+        # unconditionally now that the audio worker is arbiter-gated (Phase D2).
+        # TorchMemoryProbe is lazy (stores an int; no torch import / CUDA context
+        # at construction), so CUDA-less unit tests that never acquire() stay
+        # green; the first (blocking) probe is pre-warmed off the loop in start().
+        from .gpu_info import TorchMemoryProbe
+        from .orchestrator import VramArbiter
+        self.arbiter = VramArbiter(
+            TorchMemoryProbe(), config.gpu.vram_headroom_bytes
+        )
+
+        # Audio queue and worker (gated through the arbiter)
         self.queue = QueueManager(
             max_size=config.queue.max_size,
             request_timeout=config.queue.request_timeout,
             queue_name="audio",
         )
-        self.worker = GPUWorker(config, self.queue)
+        self.worker = GPUWorker(config, self.queue, self.arbiter)
 
         # Video queue and worker (created if enabled)
         self.video_queue: Optional[QueueManager] = None
@@ -145,28 +156,25 @@ class GPUServer:
                 request_timeout=config.video_queue.request_timeout,
                 queue_name="video",
             )
-            self.video_worker = VideoWorker(config, self.video_queue)
+            self.video_worker = VideoWorker(config, self.video_queue, self.arbiter)
 
-        # LLM queue + worker + GPU arbiter (created if enabled). The arbiter is
-        # the single VRAM admission point; today only the LLM worker is routed
-        # through it (audio/video fold in later). Constructing TorchMemoryProbe
-        # is lazy — the first (CUDA-context-creating) probe happens on the first
-        # acquire, off the constructor.
-        self.arbiter = None
+        # LLM queue + worker (created if enabled)
         self.llm_queue: Optional[QueueManager] = None
         self.llm_worker: Optional[LlmWorker] = None
         if config.llm.enabled:
-            from .gpu_info import TorchMemoryProbe
-            from .orchestrator import VramArbiter
-            self.arbiter = VramArbiter(
-                TorchMemoryProbe(), config.gpu.vram_headroom_bytes
-            )
             self.llm_queue = QueueManager(
                 max_size=config.llm_queue.max_size,
                 request_timeout=config.llm_queue.request_timeout,
                 queue_name="llm",
             )
             self.llm_worker = LlmWorker(config, self.llm_queue, self.arbiter)
+
+        # Register every worker's arbiter residents in ONE place, synchronously,
+        # before any worker task can acquire (F9 register-before-acquire). Audio
+        # residents come from the GPUWorker's handles; video has none (transient
+        # VRAM only); the LLM worker registers its own resident in start()
+        # (nothing else requires the 'llm' key, so its later registration is safe).
+        self._register_residents()
 
         self._authenticated_clients: Set[WebSocketServerProtocol] = set()
         self._pending_connections: Set[WebSocketServerProtocol] = set()  # Pre-auth connections
@@ -177,6 +185,11 @@ class GPUServer:
         self._worker_task = None
         self._video_worker_task = None
         self._llm_worker_task = None
+
+    def _register_residents(self) -> None:
+        """Register all arbiter residents synchronously at construction (F9)."""
+        for resident in self.worker.residents():
+            self.arbiter.register(resident)
 
     def _build_workloads(self) -> dict:
         """Advertise which workloads this server can perform, so a client can
@@ -219,6 +232,12 @@ class GPUServer:
 
         # Create SSL context if TLS is enabled
         ssl_context = create_ssl_context(self.config.tls)
+
+        # Pre-warm the VRAM probe off the event loop: the first mem_get_info
+        # creates the CUDA context (blocking), and we don't want the first real
+        # admission charged for it or the loop stalled (F9).
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self.arbiter.prewarm)
 
         # Start the audio worker
         self._worker_task = asyncio.create_task(self.worker.start())
