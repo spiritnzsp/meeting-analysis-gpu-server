@@ -265,6 +265,56 @@ class VideoQueueConfig:
 
 
 @dataclass
+class LlmConfig:
+    """On-device LLM (summarisation) configuration.
+
+    Disabled by default: the LLM workload is opt-in and only runs where a GGUF
+    model and enough VRAM exist. When enabled the server advertises the ``llm``
+    capability and accepts LLM_GENERATE requests. The tuned defaults mirror the
+    app's LlamaCppProvider (Qwen2.5-14B-Q5_K_M on a 16GB card): q8 KV cache +
+    flash attention so a 14B fits ~28K context. ``estimated_vram_bytes`` is what
+    the arbiter reserves for the loaded weights; the KV cache growth is charged
+    separately as transient headroom per request.
+    """
+    enabled: bool = False
+    model_path: str = ""
+    n_ctx: int = 28672
+    n_gpu_layers: int = -1
+    flash_attn: bool = True
+    kv_cache_type: int = 8  # llama_cpp type 8 = Q8_0 KV
+    temperature: float = 0.3
+    max_tokens: int = 4000
+    estimated_vram_gb: float = 11.0        # loaded 14B-Q5 weights + q8 KV baseline
+    kv_headroom_gb: float = 2.0            # transient per-request KV-growth headroom
+
+    @property
+    def estimated_vram_bytes(self) -> int:
+        return int(self.estimated_vram_gb * 1024 ** 3)
+
+    @property
+    def kv_headroom_bytes(self) -> int:
+        return int(self.kv_headroom_gb * 1024 ** 3)
+
+
+@dataclass
+class LlmQueueConfig:
+    """LLM request queue configuration."""
+    max_size: int = 50
+    request_timeout: int = 1800        # 30 min waiting in queue
+    processing_timeout: int = 600      # 10 min per generation
+
+
+@dataclass
+class GpuConfig:
+    """GPU resource-arbiter configuration."""
+    vram_headroom_gb: float = 1.0  # safety margin the arbiter never hands out
+
+    @property
+    def vram_headroom_bytes(self) -> int:
+        return int(self.vram_headroom_gb * 1024 ** 3)
+
+
+@dataclass
 class Config:
     """Main configuration container."""
     server: ServerConfig = field(default_factory=ServerConfig)
@@ -276,6 +326,9 @@ class Config:
     tls: TLSConfig = field(default_factory=TLSConfig)
     video_encoding: VideoEncodingConfig = field(default_factory=VideoEncodingConfig)
     video_queue: VideoQueueConfig = field(default_factory=VideoQueueConfig)
+    llm: LlmConfig = field(default_factory=LlmConfig)
+    llm_queue: LlmQueueConfig = field(default_factory=LlmQueueConfig)
+    gpu: GpuConfig = field(default_factory=GpuConfig)
 
 
 def load_config(config_path: Optional[Path] = None, fail_on_error: bool = True) -> Config:

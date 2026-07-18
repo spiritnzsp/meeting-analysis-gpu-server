@@ -24,7 +24,7 @@ from .validation import (
 
 # Protocol versioning
 # Format: (major, minor) - major version changes break compatibility
-PROTOCOL_VERSION = (1, 1)
+PROTOCOL_VERSION = (1, 2)  # v1.2: additive LLM_GENERATE workload + gpu/workloads capability
 PROTOCOL_VERSION_STRING = f"{PROTOCOL_VERSION[0]}.{PROTOCOL_VERSION[1]}"
 MIN_COMPATIBLE_VERSION = (1, 0)  # Minimum client version server will accept (v1.0 clients still supported)
 
@@ -76,6 +76,7 @@ class MessageType(str, Enum):
     CANCEL = "cancel"
     PING = "ping"
     VIDEO_ENCODE = "video_encode"
+    LLM_GENERATE = "llm_generate"
 
     # Server -> Client
     AUTH_OK = "auth_ok"
@@ -87,6 +88,7 @@ class MessageType(str, Enum):
     PONG = "pong"
     CANCELLED = "cancelled"
     VIDEO_RESULT = "video_result"
+    LLM_RESULT = "llm_result"
 
 
 class ProcessingStage(str, Enum):
@@ -303,6 +305,99 @@ class ProcessingResult:
         if self.warnings:
             data["warnings"] = self.warnings
         return json.dumps(data)
+
+
+@dataclass
+class LlmGenerateRequest:
+    """LLM generation request from client (v1.2).
+
+    The server is a GENERIC LLM executor: the client sends the complete prompts
+    (any summarisation coverage/consolidation steering is applied client-side,
+    keeping prompt policy in one place). ``response_format`` of "json_object"
+    asks llama.cpp to constrain output to valid JSON.
+    """
+    request_id: str
+    system_prompt: str
+    user_prompt: str
+    temperature: Optional[float] = None   # None -> server config default
+    max_tokens: Optional[int] = None      # None -> server config default
+    response_format: Optional[str] = None  # e.g. "json_object"
+    priority: int = 0
+    meeting_name: str = ""                 # for logging/display only
+
+    def to_json(self) -> str:
+        return json.dumps({
+            "type": MessageType.LLM_GENERATE,
+            "request_id": self.request_id,
+            "system_prompt": self.system_prompt,
+            "user_prompt": self.user_prompt,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "response_format": self.response_format,
+            "priority": self.priority,
+            "meeting_name": self.meeting_name,
+        })
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> 'LlmGenerateRequest':
+        request_id = data.get("request_id")
+        if not request_id or not isinstance(request_id, str):
+            raise ValidationError("request_id", "must be a non-empty string")
+        user_prompt = data.get("user_prompt")
+        if not isinstance(user_prompt, str) or not user_prompt:
+            raise ValidationError("user_prompt", "must be a non-empty string")
+        system_prompt = data.get("system_prompt", "")
+        if not isinstance(system_prompt, str):
+            raise ValidationError("system_prompt", "must be a string")
+        temperature = data.get("temperature")
+        if temperature is not None and not isinstance(temperature, (int, float)):
+            raise ValidationError("temperature", "must be a number or null")
+        max_tokens = data.get("max_tokens")
+        if max_tokens is not None and (not isinstance(max_tokens, int) or max_tokens <= 0):
+            raise ValidationError("max_tokens", "must be a positive integer or null")
+        return cls(
+            request_id=request_id,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            response_format=data.get("response_format"),
+            priority=validate_priority(data.get("priority", 0)),
+            meeting_name=str(data.get("meeting_name", "")),
+        )
+
+
+@dataclass
+class LlmGenerateResult:
+    """LLM generation result from server (v1.2)."""
+    request_id: str
+    success: bool
+    text: str = ""
+    finish_reason: str = ""        # "stop" | "length" | ""
+    error_message: str = ""
+    processing_time_seconds: float = 0.0
+
+    def to_json(self) -> str:
+        return json.dumps({
+            "type": MessageType.LLM_RESULT,
+            "request_id": self.request_id,
+            "success": self.success,
+            "text": self.text,
+            "finish_reason": self.finish_reason,
+            "error_message": self.error_message,
+            "processing_time_seconds": self.processing_time_seconds,
+        })
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> 'LlmGenerateResult':
+        return cls(
+            request_id=str(data.get("request_id", "")),
+            success=bool(data.get("success", False)),
+            text=str(data.get("text", "")),
+            finish_reason=str(data.get("finish_reason", "")),
+            error_message=str(data.get("error_message", "")),
+            processing_time_seconds=float(data.get("processing_time_seconds", 0.0)),
+        )
 
 
 @dataclass
