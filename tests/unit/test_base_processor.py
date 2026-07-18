@@ -1,5 +1,6 @@
 """Tests for BaseProcessor abstract base class."""
 import asyncio
+import threading
 import pytest
 from unittest.mock import MagicMock
 
@@ -60,6 +61,27 @@ class TestBaseProcessorLifecycle:
         proc.shutdown()
         proc.shutdown()  # Should not raise
         assert proc._shutdown
+
+    def test_shutdown_skips_unload_when_drain_times_out(self):
+        # P1-1: if the executor drain times out, a GPU kernel may still be live,
+        # so the model must be LEAKED (not freed) to avoid CUDA-context
+        # corruption. _unload_resources must NOT run in that case.
+        proc = ConcreteProcessor()
+        started = threading.Event()
+        release = threading.Event()
+
+        def block():
+            started.set()
+            release.wait(5)
+
+        proc._executor.submit(block)
+        assert started.wait(1)
+        try:
+            proc.shutdown(timeout=0.2)  # cannot drain while `block` holds the thread
+            assert proc._shutdown
+            assert not proc.unloaded  # leaked, not freed
+        finally:
+            release.set()
 
 
 class TestBaseProcessorCancellation:

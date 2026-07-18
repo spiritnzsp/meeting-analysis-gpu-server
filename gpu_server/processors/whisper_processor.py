@@ -20,6 +20,9 @@ logger = get_logger(__name__)
 # it tries to import WhisperProcessor, so no circular import issue
 from . import ProcessorCancelled
 from .base_processor import BaseProcessor
+from ..orchestrator.resident_processor_handle import ResidentBinding
+
+WHISPER_MODEL_KEY = "whisper"
 
 
 class WhisperProcessor(BaseProcessor):
@@ -51,6 +54,25 @@ class WhisperProcessor(BaseProcessor):
     def processor_name(self) -> str:
         return "Whisper"
 
+    # --- residency (driven by the arbiter via ResidentProcessorHandle) --------
+
+    def resident_bindings(self) -> list[ResidentBinding]:
+        """Declare this processor's single arbiter resident. The handle builds
+        the ResidentModel from this; the arbiter loads/evicts it. Bound to
+        ``config.model`` — the server runs exactly the configured model (see
+        ``transcribe`` for why per-request overrides are dropped)."""
+        return [
+            ResidentBinding(
+                key=WHISPER_MODEL_KEY,
+                estimated_vram_bytes=self.config.estimated_vram_bytes,
+                load_fn=self._load_model_sync,
+                unload_fn=self._unload_resources,
+            )
+        ]
+
+    def is_loaded(self) -> bool:
+        return self._model is not None
+
     def _unload_resources(self) -> None:
         """Unload the model to free GPU memory."""
         if self._model is not None:
@@ -72,24 +94,25 @@ class WhisperProcessor(BaseProcessor):
         """Unload the model to free GPU memory."""
         self._unload_resources()
 
-    def _ensure_model_sync(self, model_name: Optional[str] = None):
-        """Load the model if not already loaded (synchronous, runs in executor)."""
-        target_model = model_name or self.config.model
-
-        if self._model is not None and self._model_name == target_model:
+    def _load_model_sync(self) -> None:
+        """Load the configured Whisper model (blocking; runs on the executor
+        thread). Idempotent. Constrained to ``config.model`` — a fixed-key
+        arbiter resident cannot represent "which model is resident", so the
+        per-request override capability is deliberately dropped."""
+        if self._model is not None:
             return  # Already loaded
 
         try:
             from faster_whisper import WhisperModel
 
-            logger.info(f"Loading Whisper model: {target_model}")
+            logger.info(f"Loading Whisper model: {self.config.model}")
             self._model = WhisperModel(
-                target_model,
+                self.config.model,
                 device=self.config.device,
                 compute_type=self.config.compute_type,
             )
-            self._model_name = target_model
-            logger.info(f"Whisper model loaded: {target_model}")
+            self._model_name = self.config.model
+            logger.info(f"Whisper model loaded: {self.config.model}")
 
         except Exception as e:
             logger.error(f"Failed to load Whisper model: {e}")
@@ -174,14 +197,25 @@ class WhisperProcessor(BaseProcessor):
         self._check_shutdown()
         self._begin_operation()
 
+        # The server is constrained to config.model: a fixed-key arbiter resident
+        # can't represent a per-request model swap, so an override is logged and
+        # ignored rather than silently running the resident model under a
+        # different name. (Key-per-variant would need dynamic registration, which
+        # breaks the register-before-acquire invariant.)
+        if model_override and model_override != self.config.model:
+            logger.warning(
+                f"Ignoring whisper model_override='{model_override}'; server is "
+                f"constrained to config.model='{self.config.model}'"
+            )
+
         loop = asyncio.get_running_loop()
 
         try:
-            # Load model in executor (blocking operation)
+            # Load model in executor (blocking operation). Idempotent: when the
+            # arbiter already loaded the resident (D2 gating), this is a no-op.
             await loop.run_in_executor(
                 self._executor,
-                self._ensure_model_sync,
-                model_override
+                self._load_model_sync,
             )
 
             # Write audio to temp file with robust cleanup (faster-whisper needs file path)

@@ -22,6 +22,10 @@ logger = get_logger(__name__)
 # Import from package __init__.py - defined there to avoid duplication
 from . import ProcessorCancelled
 from .base_processor import BaseProcessor
+from ..orchestrator.resident_processor_handle import ResidentBinding
+
+PYANNOTE_MODEL_KEY = "pyannote"
+PYANNOTE_EMBEDDING_KEY = "pyannote_embedding"
 
 
 class PyAnnoteProcessor(BaseProcessor):
@@ -54,25 +58,66 @@ class PyAnnoteProcessor(BaseProcessor):
     def processor_name(self) -> str:
         return "PyAnnote"
 
-    def _unload_resources(self) -> None:
-        """Unload models to free GPU memory."""
-        if self._pipeline is not None:
-            del self._pipeline
-            self._pipeline = None
-            logger.info("PyAnnote pipeline unloaded")
+    # --- residency (driven by the arbiter via ResidentProcessorHandle) --------
 
-        if self._embedding_model is not None:
-            del self._embedding_model
-            self._embedding_model = None
-            logger.info("PyAnnote embedding model unloaded")
+    def resident_bindings(self) -> list[ResidentBinding]:
+        """Declare this processor's TWO independently-evictable arbiter
+        residents: the diarization pipeline and the speaker-embedding model.
+        They MUST have separate load/unload so evicting one does not desync the
+        other's loaded-ness (the embedding model is often unused and should be
+        evictable on its own). The embedding load uses the server's configured
+        HF token (no per-request client token on the arbiter path)."""
+        return [
+            ResidentBinding(
+                key=PYANNOTE_MODEL_KEY,
+                estimated_vram_bytes=self.config.estimated_vram_bytes,
+                load_fn=self._ensure_pipeline_sync,
+                unload_fn=self._unload_pipeline,
+            ),
+            ResidentBinding(
+                key=PYANNOTE_EMBEDDING_KEY,
+                estimated_vram_bytes=self.config.embedding_estimated_vram_bytes,
+                load_fn=self._ensure_embedding_model_sync,
+                unload_fn=self._unload_embedding,
+            ),
+        ]
 
-        # Force GPU memory cleanup
+    def is_pipeline_loaded(self) -> bool:
+        return self._pipeline is not None
+
+    def is_embedding_loaded(self) -> bool:
+        return self._embedding_model is not None
+
+    @staticmethod
+    def _empty_cuda_cache() -> None:
         try:
             import torch
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         except ImportError:
             pass
+
+    def _unload_pipeline(self) -> None:
+        """Free ONLY the diarization pipeline (one of the two residents)."""
+        if self._pipeline is not None:
+            del self._pipeline
+            self._pipeline = None
+            logger.info("PyAnnote pipeline unloaded")
+            self._empty_cuda_cache()
+
+    def _unload_embedding(self) -> None:
+        """Free ONLY the speaker-embedding model (one of the two residents)."""
+        if self._embedding_model is not None:
+            del self._embedding_model
+            self._embedding_model = None
+            logger.info("PyAnnote embedding model unloaded")
+            self._empty_cuda_cache()
+
+    def _unload_resources(self) -> None:
+        """Unload BOTH models — the BaseProcessor.shutdown path frees everything.
+        Per-resident eviction goes through _unload_pipeline / _unload_embedding."""
+        self._unload_pipeline()
+        self._unload_embedding()
 
     # Keep unload() as a public alias for backward compatibility
     def unload(self):

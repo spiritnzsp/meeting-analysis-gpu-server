@@ -205,6 +205,18 @@ class QueueConfig:
     processing_timeout: int = 1800  # seconds - timeout for active processing (30 min default)
 
 
+@dataclass(frozen=True)
+class VramEstimate:
+    """A VRAM amount expressed in GB, with the single gb→bytes conversion the
+    codebase shares. One audit point for VRAM sizing — deliberately NOT a
+    resource-scheduler abstraction; it just carries a number and its unit."""
+    gb: float
+
+    @property
+    def bytes(self) -> int:
+        return int(self.gb * 1024 ** 3)
+
+
 @dataclass
 class WhisperConfig:
     """Whisper transcription configuration."""
@@ -213,6 +225,14 @@ class WhisperConfig:
     compute_type: str = "float16"
     beam_size: int = 5
     language: Optional[str] = None
+    # Resident VRAM the arbiter reserves for the loaded model (weights + compute
+    # buffers). ~3 GB for large-v3 fp16, generous; tuned from measured
+    # mem_get_info deltas. The OOM-tolerant load backstops an underestimate.
+    estimated_vram_gb: float = 3.0
+
+    @property
+    def estimated_vram_bytes(self) -> int:
+        return VramEstimate(self.estimated_vram_gb).bytes
 
 
 @dataclass
@@ -221,6 +241,20 @@ class PyAnnoteConfig:
     device: str = "cuda"
     huggingface_token: str = ""
     model: str = "pyannote/speaker-diarization-3.1"
+    # Two independently-evictable residents: the diarization pipeline (~2 GB) and
+    # the speaker-embedding model (~0.5 GB, loaded only when embeddings are
+    # requested). Sized separately so evicting one does not over/under-account
+    # the other (they are separate arbiter residents).
+    estimated_vram_gb: float = 2.0            # diarization pipeline
+    embedding_estimated_vram_gb: float = 0.5  # speaker-embedding model
+
+    @property
+    def estimated_vram_bytes(self) -> int:
+        return VramEstimate(self.estimated_vram_gb).bytes
+
+    @property
+    def embedding_estimated_vram_bytes(self) -> int:
+        return VramEstimate(self.embedding_estimated_vram_gb).bytes
 
 
 @dataclass
@@ -254,6 +288,14 @@ class VideoEncodingConfig:
     temp_directory: Optional[str] = None  # Must NOT be tmpfs for large files
     # Protocol v1.1: shared filesystem transfer
     shared_paths: List[str] = field(default_factory=list)  # Paths accessible to both client and server
+    # Transient VRAM the arbiter reserves for one NVENC encode session (held only
+    # for the encode, invisible to torch's allocator). Generous default; tuned
+    # from measured deltas. The video loop is SERIAL, so at most one is held.
+    per_session_vram_gb: float = 1.5
+
+    @property
+    def per_session_vram_bytes(self) -> int:
+        return VramEstimate(self.per_session_vram_gb).bytes
 
 
 @dataclass
@@ -414,6 +456,7 @@ def load_config(config_path: Optional[Path] = None, fail_on_error: bool = True) 
                     compute_type=data['whisper'].get('compute_type', config.whisper.compute_type),
                     beam_size=data['whisper'].get('beam_size', config.whisper.beam_size),
                     language=data['whisper'].get('language'),
+                    estimated_vram_gb=data['whisper'].get('estimated_vram_gb', config.whisper.estimated_vram_gb),
                 )
 
             # PyAnnote config
@@ -422,6 +465,8 @@ def load_config(config_path: Optional[Path] = None, fail_on_error: bool = True) 
                     device=data['pyannote'].get('device', config.pyannote.device),
                     huggingface_token=data['pyannote'].get('huggingface_token', config.pyannote.huggingface_token),
                     model=data['pyannote'].get('model', config.pyannote.model),
+                    estimated_vram_gb=data['pyannote'].get('estimated_vram_gb', config.pyannote.estimated_vram_gb),
+                    embedding_estimated_vram_gb=data['pyannote'].get('embedding_estimated_vram_gb', config.pyannote.embedding_estimated_vram_gb),
                 )
 
             # Logging config
@@ -455,6 +500,7 @@ def load_config(config_path: Optional[Path] = None, fail_on_error: bool = True) 
                     data_upload_timeout=ve.get('data_upload_timeout', config.video_encoding.data_upload_timeout),
                     temp_directory=ve.get('temp_directory', config.video_encoding.temp_directory),
                     shared_paths=ve.get('shared_paths', config.video_encoding.shared_paths),
+                    per_session_vram_gb=ve.get('per_session_vram_gb', config.video_encoding.per_session_vram_gb),
                 )
 
             # Video queue config
@@ -631,6 +677,14 @@ def validate_config(config: Config, strict: bool = True):
             f"Invalid whisper.beam_size: {config.whisper.beam_size}. "
             "Must be between 1 and 10"
         )
+    # Arbiter VRAM sizing must be positive — a non-positive estimate would let the
+    # budget over-admit (a "free" model) and defeat admission control.
+    if config.whisper.estimated_vram_gb <= 0:
+        errors.append(f"Invalid whisper.estimated_vram_gb: {config.whisper.estimated_vram_gb}. Must be > 0")
+    if config.pyannote.estimated_vram_gb <= 0:
+        errors.append(f"Invalid pyannote.estimated_vram_gb: {config.pyannote.estimated_vram_gb}. Must be > 0")
+    if config.pyannote.embedding_estimated_vram_gb <= 0:
+        errors.append(f"Invalid pyannote.embedding_estimated_vram_gb: {config.pyannote.embedding_estimated_vram_gb}. Must be > 0")
 
     # Device validation for both Whisper and PyAnnote
     valid_device_patterns = {'cpu', 'cuda'}
@@ -659,6 +713,8 @@ def validate_config(config: Config, strict: bool = True):
             errors.append(f"Invalid video_encoding.default_preset: '{config.video_encoding.default_preset}'. Must be p1-p7")
         if config.video_encoding.max_sessions < 1:
             errors.append(f"Invalid video_encoding.max_sessions: {config.video_encoding.max_sessions}. Must be >= 1")
+        if config.video_encoding.per_session_vram_gb <= 0:
+            errors.append(f"Invalid video_encoding.per_session_vram_gb: {config.video_encoding.per_session_vram_gb}. Must be > 0")
         if config.video_encoding.temp_directory:
             temp_path = Path(config.video_encoding.temp_directory)
             if not temp_path.exists():

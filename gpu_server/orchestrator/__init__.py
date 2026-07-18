@@ -10,6 +10,9 @@ Public surface:
 """
 from .eviction_policy import EvictionCandidate, EvictionPolicy, LruEvictionPolicy
 from .resident_model import ManagedModel, ResidentModel
+from .resident_processor_handle import (
+    ResidentBinding, ResidentCapable, ResidentProcessorHandle,
+)
 from .vram_arbiter import GpuLease, VramArbiter, WorkloadNeed
 from .vram_budget import VramBudget
 
@@ -19,6 +22,9 @@ __all__ = [
     "GpuLease",
     "ResidentModel",
     "ManagedModel",
+    "ResidentBinding",
+    "ResidentCapable",
+    "ResidentProcessorHandle",
     "EvictionPolicy",
     "LruEvictionPolicy",
     "EvictionCandidate",
