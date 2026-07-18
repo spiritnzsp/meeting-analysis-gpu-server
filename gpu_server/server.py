@@ -605,6 +605,22 @@ class GPUServer:
             ).to_json())
             return
 
+        # Per-request rate limit — LLM generations are long (minutes); without
+        # this a client could fill the queue behind the global flood limiter.
+        rate_limiter = self._rate_limiters.get(websocket)
+        if rate_limiter:
+            if (rate_limiter.get_request_count(self.config.server.rate_limit_window)
+                    >= self.config.server.rate_limit_requests):
+                await websocket.send(ErrorMessage(
+                    request_id=request.request_id,
+                    error=f"Rate limit exceeded. Max {self.config.server.rate_limit_requests} "
+                          f"requests per {self.config.server.rate_limit_window} seconds.",
+                    recoverable=True,
+                    error_code="RATE_LIMIT_EXCEEDED",
+                ).to_json())
+                return
+            rate_limiter.record_request()
+
         success = await self.llm_queue.enqueue(request, websocket)
         if success:
             await websocket.send(json.dumps({

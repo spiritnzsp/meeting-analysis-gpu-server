@@ -80,26 +80,49 @@ class LlmWorker:
         request = queued.request
         websocket = queued.websocket
         t0 = time.time()
+        # Acquire the lease OUTSIDE the processing timeout (F4). The lease keeps
+        # the LLM resident for the whole generation; the arbiter loads it
+        # (evicting others if needed) and reserves a small compute-scratch margin.
+        need = WorkloadNeed(
+            required_models=(LLM_MODEL_KEY,),
+            transient_bytes=self.config.llm.kv_headroom_bytes,
+        )
         try:
-            # Acquire the lease OUTSIDE the processing timeout (F4). The lease
-            # keeps the LLM resident for the whole generation; the arbiter loads
-            # it (evicting others if needed) and reserves KV-growth headroom.
-            need = WorkloadNeed(
-                required_models=(LLM_MODEL_KEY,),
-                transient_bytes=self.config.llm.kv_headroom_bytes,
-            )
             async with await self._arbiter.acquire(need):
-                text, finish_reason = await asyncio.wait_for(
-                    self._processor.generate(
-                        system_prompt=request.system_prompt,
-                        user_prompt=request.user_prompt,
-                        temperature=request.temperature,
-                        max_tokens=request.max_tokens,
-                        response_format=request.response_format,
-                        request_id=request.request_id,
-                    ),
-                    timeout=self.config.llm_queue.processing_timeout,
-                )
+                gen_task = asyncio.ensure_future(self._processor.generate(
+                    system_prompt=request.system_prompt,
+                    user_prompt=request.user_prompt,
+                    temperature=request.temperature,
+                    max_tokens=request.max_tokens,
+                    response_format=request.response_format,
+                    request_id=request.request_id,
+                ))
+                try:
+                    # shield so the timeout does NOT cancel the coroutine — a
+                    # run_in_executor job can't be cancelled anyway. On timeout we
+                    # signal cancel and DRAIN (still holding the lease) so the
+                    # executor thread actually stops before the next request's
+                    # _begin_operation clears this request's cancel flag (C2), and
+                    # so it stops head-of-line-blocking the single-thread executor.
+                    text, finish_reason = await asyncio.wait_for(
+                        asyncio.shield(gen_task),
+                        timeout=self.config.llm_queue.processing_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    self._processor.cancel(request.request_id)
+                    try:
+                        await gen_task  # drain: raises ProcessorCancelled when the stream sees the flag
+                    except (ProcessorCancelled, Exception):
+                        pass
+                    await self._send(websocket, LlmGenerateResult(
+                        request_id=request.request_id, success=False,
+                        error_message=(
+                            f"LLM generation timed out after "
+                            f"{self.config.llm_queue.processing_timeout}s"
+                        ),
+                        processing_time_seconds=time.time() - t0,
+                    ))
+                    return
             await self._send(websocket, LlmGenerateResult(
                 request_id=request.request_id,
                 success=True,
@@ -111,19 +134,6 @@ class LlmWorker:
             await self._send(websocket, LlmGenerateResult(
                 request_id=request.request_id, success=False,
                 error_message="Generation cancelled",
-                processing_time_seconds=time.time() - t0,
-            ))
-        except asyncio.TimeoutError:
-            # Stop the in-flight generation; the executor-serialized teardown
-            # keeps VRAM safe even though the lease has been released.
-            if self._processor:
-                self._processor.cancel(request.request_id)
-            await self._send(websocket, LlmGenerateResult(
-                request_id=request.request_id, success=False,
-                error_message=(
-                    f"LLM generation timed out after "
-                    f"{self.config.llm_queue.processing_timeout}s"
-                ),
                 processing_time_seconds=time.time() - t0,
             ))
         except Exception as e:  # noqa: BLE001

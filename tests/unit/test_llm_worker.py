@@ -1,8 +1,10 @@
 """Tests for LlmWorker request handling and server LLM wiring (fakes, no GPU)."""
+import asyncio
 import json
 
 from gpu_server.config import Config
 from gpu_server.llm_worker import LlmWorker
+from gpu_server.processors import ProcessorCancelled
 from gpu_server.protocol import LlmGenerateRequest
 from gpu_server.server import GPUServer
 
@@ -54,6 +56,26 @@ class FakeWS:
         self.sent.append(msg)
 
 
+class SlowProcessor:
+    """Generation that runs until cancelled — to exercise the timeout/drain path."""
+
+    def __init__(self):
+        self.is_processing = False
+        self._cancelled = False
+        self.cancel_called_with = None
+
+    async def generate(self, request_id="", **kwargs):
+        for _ in range(10000):
+            if self._cancelled:
+                raise ProcessorCancelled("cancelled")
+            await asyncio.sleep(0.01)
+        return "done", "stop"
+
+    def cancel(self, request_id):
+        self.cancel_called_with = request_id
+        self._cancelled = True
+
+
 class FakeQueued:
     def __init__(self, request, websocket):
         self.request = request
@@ -93,6 +115,53 @@ async def test_process_failure_sends_unsuccessful_result():
     assert result["success"] is False
     assert "boom" in result["error_message"]
     assert worker._arbiter.lease.exited is True  # lease released even on failure
+
+
+async def test_acquire_reserves_kv_headroom_as_transient():
+    # C8: the compute-scratch margin is passed as WorkloadNeed.transient_bytes.
+    cfg = Config()
+    worker = LlmWorker(cfg, queue=None, arbiter=FakeArbiter())
+    worker._processor = FakeProcessor()
+    await worker._process(FakeQueued(LlmGenerateRequest("r", "s", "u"), FakeWS()))
+    need = worker._arbiter.acquired[0]
+    assert need.required_models == ("llm",)
+    assert need.transient_bytes == cfg.llm.kv_headroom_bytes
+
+
+async def test_timeout_cancels_drains_and_releases_lease():
+    # C2/C6: a timed-out generation is actually cancelled and drained (still
+    # holding the lease) before the worker moves on.
+    cfg = Config()
+    cfg.llm_queue.processing_timeout = 0.05
+    worker = LlmWorker(cfg, queue=None, arbiter=FakeArbiter())
+    proc = SlowProcessor()
+    worker._processor = proc
+    ws = FakeWS()
+    await worker._process(FakeQueued(LlmGenerateRequest("r1", "s", "u"), ws))
+
+    result = json.loads(ws.sent[0])
+    assert result["success"] is False
+    assert "timed out" in result["error_message"]
+    assert proc.cancel_called_with == "r1"          # cancel was signalled
+    assert proc._cancelled                           # generation drained via cancel
+    assert worker._arbiter.lease.exited is True      # lease released only after drain
+
+
+async def test_processor_cancelled_reports_cancelled_result():
+    worker = _worker(FakeProcessor(raises=ProcessorCancelled("stop")))
+    ws = FakeWS()
+    await worker._process(FakeQueued(LlmGenerateRequest("r", "s", "u"), ws))
+    result = json.loads(ws.sent[0])
+    assert result["success"] is False
+    assert "cancel" in result["error_message"].lower()
+
+
+async def test_server_rejects_llm_when_disabled():
+    srv = GPUServer(Config())  # llm disabled
+    ws = FakeWS()
+    await srv._handle_llm_request(ws, {"request_id": "r", "user_prompt": "hi"})
+    msg = json.loads(ws.sent[0])
+    assert msg["error_code"] == "LLM_NOT_ENABLED"
 
 
 def test_server_has_no_llm_stack_by_default():

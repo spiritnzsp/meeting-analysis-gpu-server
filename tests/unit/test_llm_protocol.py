@@ -72,6 +72,36 @@ def test_request_rejects_bad_temperature():
         )
 
 
+def test_request_rejects_bad_response_format():
+    with pytest.raises(ValidationError):
+        LlmGenerateRequest.from_dict(
+            {"request_id": "r", "user_prompt": "hi", "response_format": "yaml"}
+        )
+    # None and "json_object" are accepted
+    assert LlmGenerateRequest.from_dict(
+        {"request_id": "r", "user_prompt": "hi", "response_format": "json_object"}
+    ).response_format == "json_object"
+
+
+def test_request_rejects_out_of_range_temperature():
+    with pytest.raises(ValidationError):
+        LlmGenerateRequest.from_dict(
+            {"request_id": "r", "user_prompt": "hi", "temperature": 5.0}
+        )
+    with pytest.raises(ValidationError):
+        LlmGenerateRequest.from_dict(
+            {"request_id": "r", "user_prompt": "hi", "temperature": -1.0}
+        )
+
+
+def test_request_rejects_oversized_prompt():
+    from gpu_server.protocol import MAX_LLM_PROMPT_CHARS
+    with pytest.raises(ValidationError):
+        LlmGenerateRequest.from_dict(
+            {"request_id": "r", "user_prompt": "x" * (MAX_LLM_PROMPT_CHARS + 1)}
+        )
+
+
 def test_result_round_trip():
     res = LlmGenerateResult(
         request_id="r1", success=True, text='{"ok": true}',

@@ -28,6 +28,11 @@ PROTOCOL_VERSION = (1, 2)  # v1.2: additive LLM_GENERATE workload + gpu/workload
 PROTOCOL_VERSION_STRING = f"{PROTOCOL_VERSION[0]}.{PROTOCOL_VERSION[1]}"
 MIN_COMPATIBLE_VERSION = (1, 0)  # Minimum client version server will accept (v1.0 clients still supported)
 
+# Upper bound on an LLM request's combined prompt size, enforced at validation
+# so oversized input is rejected before it reaches the GPU. ~1M chars is far
+# above any real meeting transcript (~110K usable at 28K tokens).
+MAX_LLM_PROMPT_CHARS = 1_000_000
+
 
 def parse_version(version_str: str) -> Tuple[int, int]:
     """Parse a version string like '1.0' into a tuple (1, 0)."""
@@ -340,30 +345,45 @@ class LlmGenerateRequest:
 
     @classmethod
     def from_dict(cls, data: Dict) -> 'LlmGenerateRequest':
-        request_id = data.get("request_id")
-        if not request_id or not isinstance(request_id, str):
-            raise ValidationError("request_id", "must be a non-empty string")
+        # Reuse the shared validators every other request type uses (charset +
+        # length caps; control-char stripping) rather than ad-hoc checks.
+        request_id = validate_request_id(data.get("request_id"))
         user_prompt = data.get("user_prompt")
         if not isinstance(user_prompt, str) or not user_prompt:
             raise ValidationError("user_prompt", "must be a non-empty string")
         system_prompt = data.get("system_prompt", "")
         if not isinstance(system_prompt, str):
             raise ValidationError("system_prompt", "must be a string")
+        # Bound prompt size at validation so an oversized prompt is rejected
+        # BEFORE it is enqueued, tokenized on the GPU thread, and possibly
+        # triggers an eviction. Far above any real transcript (~110K usable).
+        if len(user_prompt) + len(system_prompt) > MAX_LLM_PROMPT_CHARS:
+            raise ValidationError(
+                "user_prompt", f"combined prompt exceeds {MAX_LLM_PROMPT_CHARS} characters"
+            )
         temperature = data.get("temperature")
-        if temperature is not None and not isinstance(temperature, (int, float)):
-            raise ValidationError("temperature", "must be a number or null")
+        if temperature is not None:
+            if isinstance(temperature, bool) or not isinstance(temperature, (int, float)):
+                raise ValidationError("temperature", "must be a number or null")
+            if not (0.0 <= float(temperature) <= 2.0):
+                raise ValidationError("temperature", "must be between 0.0 and 2.0")
         max_tokens = data.get("max_tokens")
-        if max_tokens is not None and (not isinstance(max_tokens, int) or max_tokens <= 0):
+        if max_tokens is not None and (
+            isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens <= 0
+        ):
             raise ValidationError("max_tokens", "must be a positive integer or null")
+        response_format = data.get("response_format")
+        if response_format is not None and response_format != "json_object":
+            raise ValidationError("response_format", "must be null or 'json_object'")
         return cls(
             request_id=request_id,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             temperature=temperature,
             max_tokens=max_tokens,
-            response_format=data.get("response_format"),
+            response_format=response_format,
             priority=validate_priority(data.get("priority", 0)),
-            meeting_name=str(data.get("meeting_name", "")),
+            meeting_name=validate_meeting_name(data.get("meeting_name", "")),
         )
 
 
