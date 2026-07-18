@@ -25,26 +25,12 @@ from __future__ import annotations
 
 import asyncio
 from concurrent.futures import Executor
-from dataclasses import dataclass
-from typing import Callable, List, Protocol, runtime_checkable
+from typing import List, Optional, Protocol, runtime_checkable
 
 from ..logging_config import get_logger
-from .resident_model import ResidentModel
+from .resident_model import ResidentBinding, ResidentModel
 
 logger = get_logger(__name__)
-
-
-@dataclass(frozen=True)
-class ResidentBinding:
-    """One resident a processor owns: its stable key, its VRAM size, and the
-    blocking load/unload callables (already bound to the processor instance).
-    The processor's own executor is supplied separately by the handle, since a
-    single processor's residents all share its one executor."""
-
-    key: str
-    estimated_vram_bytes: int
-    load_fn: Callable[[], None]
-    unload_fn: Callable[[], None]
 
 
 @runtime_checkable
@@ -54,7 +40,7 @@ class ResidentCapable(Protocol):
     from the concrete processor classes."""
 
     @property
-    def executor(self) -> Executor: ...
+    def executor(self) -> Optional[Executor]: ...
     def resident_bindings(self) -> List[ResidentBinding]: ...
     def shutdown(self, timeout: float = ...) -> None: ...
 
@@ -110,18 +96,24 @@ class ResidentProcessorHandle:
         await loop.run_in_executor(None, old.shutdown)
 
         new = self._factory()
-        bindings = {b.key: b for b in new.resident_bindings()}
-        missing = set(self._residents) - set(bindings)
-        if missing:
-            # A fresh instance of the same class must expose the same residents;
-            # anything else is a programming error we must not paper over (a
-            # phantom resident would desync the registry).
-            raise KeyError(
-                f"recreated {type(new).__name__} is missing residents: {sorted(missing)}"
-            )
-        for key, resident in self._residents.items():
-            binding = bindings[key]
-            resident.rebind(new.executor, binding.load_fn, binding.unload_fn)
+        # From here on `new` owns a live executor thread. If anything fails before
+        # the swap completes, shut it down so a failed recovery doesn't strand a
+        # GPU-executor thread (F2). The handle is then left pointing at the
+        # already-shut-down `old` and is spent — the failure is a "can't happen"
+        # programming error (same class ⇒ same residents), surfaced loudly.
+        try:
+            bindings = {b.key: b for b in new.resident_bindings()}
+            missing = set(self._residents) - set(bindings)
+            if missing:
+                raise KeyError(
+                    f"recreated {type(new).__name__} is missing residents: {sorted(missing)}"
+                )
+            for key, resident in self._residents.items():
+                binding = bindings[key]
+                resident.rebind(new.executor, binding.load_fn, binding.unload_fn)
+        except BaseException:
+            new.shutdown()
+            raise
         self._processor = new
         logger.info(
             f"Recreated {type(new).__name__} and rebound residents: "

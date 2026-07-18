@@ -30,11 +30,30 @@ from __future__ import annotations
 import asyncio
 import threading
 from concurrent.futures import Executor
+from dataclasses import dataclass
 from typing import Callable, Protocol
 
 from ..logging_config import get_logger
 
 logger = get_logger(__name__)
+
+
+@dataclass(frozen=True)
+class ResidentBinding:
+    """One resident a processor owns: its stable key, its VRAM size, and the
+    blocking load/unload callables (already bound to the processor instance).
+
+    Produced by processors (``resident_bindings()``) and consumed by the arbiter
+    side (``ResidentProcessorHandle`` turns each into a ``ResidentModel``). It
+    lives here beside ``ResidentModel`` — the residency vocabulary — so a
+    processor declaring its residents does not have to import the handle
+    (consumer) module. The processor's own executor is supplied separately, since
+    a single processor's residents all share its one executor."""
+
+    key: str
+    estimated_vram_bytes: int
+    load_fn: Callable[[], None]
+    unload_fn: Callable[[], None]
 
 
 class ManagedModel(Protocol):

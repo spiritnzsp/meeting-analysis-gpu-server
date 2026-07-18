@@ -20,7 +20,7 @@ logger = get_logger(__name__)
 # it tries to import WhisperProcessor, so no circular import issue
 from . import ProcessorCancelled
 from .base_processor import BaseProcessor
-from ..orchestrator.resident_processor_handle import ResidentBinding
+from ..orchestrator.resident_model import ResidentBinding
 
 WHISPER_MODEL_KEY = "whisper"
 
@@ -48,7 +48,6 @@ class WhisperProcessor(BaseProcessor):
         super().__init__(thread_name_prefix="whisper_gpu")
         self.config = config
         self._model = None
-        self._model_name = None
 
     @property
     def processor_name(self) -> str:
@@ -78,16 +77,8 @@ class WhisperProcessor(BaseProcessor):
         if self._model is not None:
             del self._model
             self._model = None
-            self._model_name = None
             logger.info("Whisper model unloaded")
-
-            # Force GPU memory cleanup
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except ImportError:
-                pass
+            self._empty_cuda_cache()
 
     # Keep unload() as a public alias for backward compatibility
     def unload(self):
@@ -111,7 +102,6 @@ class WhisperProcessor(BaseProcessor):
                 device=self.config.device,
                 compute_type=self.config.compute_type,
             )
-            self._model_name = self.config.model
             logger.info(f"Whisper model loaded: {self.config.model}")
 
         except Exception as e:

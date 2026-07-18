@@ -22,7 +22,7 @@ logger = get_logger(__name__)
 # Import from package __init__.py - defined there to avoid duplication
 from . import ProcessorCancelled
 from .base_processor import BaseProcessor
-from ..orchestrator.resident_processor_handle import ResidentBinding
+from ..orchestrator.resident_model import ResidentBinding
 
 PYANNOTE_MODEL_KEY = "pyannote"
 PYANNOTE_EMBEDDING_KEY = "pyannote_embedding"
@@ -87,15 +87,6 @@ class PyAnnoteProcessor(BaseProcessor):
 
     def is_embedding_loaded(self) -> bool:
         return self._embedding_model is not None
-
-    @staticmethod
-    def _empty_cuda_cache() -> None:
-        try:
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except ImportError:
-            pass
 
     def _unload_pipeline(self) -> None:
         """Free ONLY the diarization pipeline (one of the two residents)."""

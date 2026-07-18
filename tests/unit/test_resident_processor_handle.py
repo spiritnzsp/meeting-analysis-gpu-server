@@ -141,6 +141,11 @@ async def test_recreate_rejects_processor_missing_a_resident():
     try:
         with pytest.raises(KeyError, match="missing residents"):
             await handle.recreate()
+        # F2: the freshly-built (bad) processor must be shut down on the error
+        # path so its executor thread is not stranded.
+        assert execs[1].shutdown_called
+        # The handle is spent but still points at the old (already-shut-down) one.
+        assert handle.processor is execs[0]
     finally:
         for proc in execs:
             proc._executor.shutdown(wait=True)
