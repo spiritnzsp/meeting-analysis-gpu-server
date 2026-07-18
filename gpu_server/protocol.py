@@ -24,9 +24,14 @@ from .validation import (
 
 # Protocol versioning
 # Format: (major, minor) - major version changes break compatibility
-PROTOCOL_VERSION = (1, 1)
+PROTOCOL_VERSION = (1, 2)  # v1.2: additive LLM_GENERATE workload + gpu/workloads capability
 PROTOCOL_VERSION_STRING = f"{PROTOCOL_VERSION[0]}.{PROTOCOL_VERSION[1]}"
 MIN_COMPATIBLE_VERSION = (1, 0)  # Minimum client version server will accept (v1.0 clients still supported)
+
+# Upper bound on an LLM request's combined prompt size, enforced at validation
+# so oversized input is rejected before it reaches the GPU. ~1M chars is far
+# above any real meeting transcript (~110K usable at 28K tokens).
+MAX_LLM_PROMPT_CHARS = 1_000_000
 
 
 def parse_version(version_str: str) -> Tuple[int, int]:
@@ -76,6 +81,7 @@ class MessageType(str, Enum):
     CANCEL = "cancel"
     PING = "ping"
     VIDEO_ENCODE = "video_encode"
+    LLM_GENERATE = "llm_generate"
 
     # Server -> Client
     AUTH_OK = "auth_ok"
@@ -87,6 +93,7 @@ class MessageType(str, Enum):
     PONG = "pong"
     CANCELLED = "cancelled"
     VIDEO_RESULT = "video_result"
+    LLM_RESULT = "llm_result"
 
 
 class ProcessingStage(str, Enum):
@@ -303,6 +310,114 @@ class ProcessingResult:
         if self.warnings:
             data["warnings"] = self.warnings
         return json.dumps(data)
+
+
+@dataclass
+class LlmGenerateRequest:
+    """LLM generation request from client (v1.2).
+
+    The server is a GENERIC LLM executor: the client sends the complete prompts
+    (any summarisation coverage/consolidation steering is applied client-side,
+    keeping prompt policy in one place). ``response_format`` of "json_object"
+    asks llama.cpp to constrain output to valid JSON.
+    """
+    request_id: str
+    system_prompt: str
+    user_prompt: str
+    temperature: Optional[float] = None   # None -> server config default
+    max_tokens: Optional[int] = None      # None -> server config default
+    response_format: Optional[str] = None  # e.g. "json_object"
+    priority: int = 0
+    meeting_name: str = ""                 # for logging/display only
+
+    def to_json(self) -> str:
+        return json.dumps({
+            "type": MessageType.LLM_GENERATE,
+            "request_id": self.request_id,
+            "system_prompt": self.system_prompt,
+            "user_prompt": self.user_prompt,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "response_format": self.response_format,
+            "priority": self.priority,
+            "meeting_name": self.meeting_name,
+        })
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> 'LlmGenerateRequest':
+        # Reuse the shared validators every other request type uses (charset +
+        # length caps; control-char stripping) rather than ad-hoc checks.
+        request_id = validate_request_id(data.get("request_id"))
+        user_prompt = data.get("user_prompt")
+        if not isinstance(user_prompt, str) or not user_prompt:
+            raise ValidationError("user_prompt", "must be a non-empty string")
+        system_prompt = data.get("system_prompt", "")
+        if not isinstance(system_prompt, str):
+            raise ValidationError("system_prompt", "must be a string")
+        # Bound prompt size at validation so an oversized prompt is rejected
+        # BEFORE it is enqueued, tokenized on the GPU thread, and possibly
+        # triggers an eviction. Far above any real transcript (~110K usable).
+        if len(user_prompt) + len(system_prompt) > MAX_LLM_PROMPT_CHARS:
+            raise ValidationError(
+                "user_prompt", f"combined prompt exceeds {MAX_LLM_PROMPT_CHARS} characters"
+            )
+        temperature = data.get("temperature")
+        if temperature is not None:
+            if isinstance(temperature, bool) or not isinstance(temperature, (int, float)):
+                raise ValidationError("temperature", "must be a number or null")
+            if not (0.0 <= float(temperature) <= 2.0):
+                raise ValidationError("temperature", "must be between 0.0 and 2.0")
+        max_tokens = data.get("max_tokens")
+        if max_tokens is not None and (
+            isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens <= 0
+        ):
+            raise ValidationError("max_tokens", "must be a positive integer or null")
+        response_format = data.get("response_format")
+        if response_format is not None and response_format != "json_object":
+            raise ValidationError("response_format", "must be null or 'json_object'")
+        return cls(
+            request_id=request_id,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            response_format=response_format,
+            priority=validate_priority(data.get("priority", 0)),
+            meeting_name=validate_meeting_name(data.get("meeting_name", "")),
+        )
+
+
+@dataclass
+class LlmGenerateResult:
+    """LLM generation result from server (v1.2)."""
+    request_id: str
+    success: bool
+    text: str = ""
+    finish_reason: str = ""        # "stop" | "length" | ""
+    error_message: str = ""
+    processing_time_seconds: float = 0.0
+
+    def to_json(self) -> str:
+        return json.dumps({
+            "type": MessageType.LLM_RESULT,
+            "request_id": self.request_id,
+            "success": self.success,
+            "text": self.text,
+            "finish_reason": self.finish_reason,
+            "error_message": self.error_message,
+            "processing_time_seconds": self.processing_time_seconds,
+        })
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> 'LlmGenerateResult':
+        return cls(
+            request_id=str(data.get("request_id", "")),
+            success=bool(data.get("success", False)),
+            text=str(data.get("text", "")),
+            finish_reason=str(data.get("finish_reason", "")),
+            error_message=str(data.get("error_message", "")),
+            processing_time_seconds=float(data.get("processing_time_seconds", 0.0)),
+        )
 
 
 @dataclass

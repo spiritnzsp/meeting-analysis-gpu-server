@@ -22,10 +22,11 @@ from .protocol import (
     MessageType, parse_message, ProcessRequest, AuthMessage,
     ProgressMessage, ProcessingStage, ErrorMessage, AuthErrorMessage,
     CancelledMessage, PROTOCOL_VERSION_STRING, is_version_compatible,
-    VideoEncodeRequest,
+    VideoEncodeRequest, LlmGenerateRequest,
 )
 from .binary_protocol import BinaryFrameType, decode_binary_frame
 from .queue_manager import QueueManager
+from .llm_worker import LlmWorker
 from .validation import ValidationError
 from .worker import GPUWorker
 from .video_worker import VideoWorker
@@ -146,6 +147,27 @@ class GPUServer:
             )
             self.video_worker = VideoWorker(config, self.video_queue)
 
+        # LLM queue + worker + GPU arbiter (created if enabled). The arbiter is
+        # the single VRAM admission point; today only the LLM worker is routed
+        # through it (audio/video fold in later). Constructing TorchMemoryProbe
+        # is lazy — the first (CUDA-context-creating) probe happens on the first
+        # acquire, off the constructor.
+        self.arbiter = None
+        self.llm_queue: Optional[QueueManager] = None
+        self.llm_worker: Optional[LlmWorker] = None
+        if config.llm.enabled:
+            from .gpu_info import TorchMemoryProbe
+            from .orchestrator import VramArbiter
+            self.arbiter = VramArbiter(
+                TorchMemoryProbe(), config.gpu.vram_headroom_bytes
+            )
+            self.llm_queue = QueueManager(
+                max_size=config.llm_queue.max_size,
+                request_timeout=config.llm_queue.request_timeout,
+                queue_name="llm",
+            )
+            self.llm_worker = LlmWorker(config, self.llm_queue, self.arbiter)
+
         self._authenticated_clients: Set[WebSocketServerProtocol] = set()
         self._pending_connections: Set[WebSocketServerProtocol] = set()  # Pre-auth connections
         self._client_info: Dict[WebSocketServerProtocol, dict] = {}
@@ -154,6 +176,18 @@ class GPUServer:
         self._server = None
         self._worker_task = None
         self._video_worker_task = None
+        self._llm_worker_task = None
+
+    def _build_workloads(self) -> dict:
+        """Advertise which workloads this server can perform, so a client can
+        discover (e.g.) that remote LLM summarisation is available. Additive
+        capability field in auth_ok; old clients ignore it."""
+        return {
+            "transcribe": True,
+            "diarize": True,
+            "encode": self.config.video_encoding.enabled,
+            "llm": self.config.llm.enabled,
+        }
 
     def _build_transfer_capabilities(self) -> dict:
         """Build transfer_capabilities dict for auth_ok response."""
@@ -192,6 +226,10 @@ class GPUServer:
         # Start the video worker if enabled
         if self.video_worker:
             self._video_worker_task = asyncio.create_task(self.video_worker.start())
+
+        # Start the LLM worker if enabled
+        if self.llm_worker:
+            self._llm_worker_task = asyncio.create_task(self.llm_worker.start())
 
         # Start WebSocket server
         self._server = await websockets.serve(
@@ -250,6 +288,16 @@ class GPUServer:
             self._video_worker_task.cancel()
             try:
                 await self._video_worker_task
+            except asyncio.CancelledError:
+                pass
+
+        # Stop the LLM worker
+        if self.llm_worker:
+            await self.llm_worker.stop()
+        if self._llm_worker_task:
+            self._llm_worker_task.cancel()
+            try:
+                await self._llm_worker_task
             except asyncio.CancelledError:
                 pass
 
@@ -365,6 +413,7 @@ class GPUServer:
                 "protocol_version": PROTOCOL_VERSION_STRING,
                 "video_encoding_enabled": self.config.video_encoding.enabled,
                 "transfer_capabilities": self._build_transfer_capabilities(),
+                "workloads": self._build_workloads(),
             }))
             logger.info(LogEvents.CLIENT_AUTHENTICATED, data={'auth_disabled': True})
             return True
@@ -429,6 +478,7 @@ class GPUServer:
                 "queue_size": self.queue.size,
                 "video_encoding_enabled": self.config.video_encoding.enabled,
                 "transfer_capabilities": self._build_transfer_capabilities(),
+                "workloads": self._build_workloads(),
             }))
 
             logger.info(
@@ -503,6 +553,9 @@ class GPUServer:
         elif msg_type == MessageType.VIDEO_ENCODE:
             await self._handle_video_encode_request(websocket, data)
 
+        elif msg_type == MessageType.LLM_GENERATE:
+            await self._handle_llm_request(websocket, data)
+
         elif msg_type == MessageType.CANCEL:
             await self._handle_cancel(websocket, data)
 
@@ -528,6 +581,59 @@ class GPUServer:
                 request_id=data.get("request_id", ""),
                 error=f"Unknown message type: {msg_type}",
                 error_code="UNKNOWN_MESSAGE_TYPE",
+            ).to_json())
+
+    async def _handle_llm_request(self, websocket: WebSocketServerProtocol, data: dict):
+        """Validate and queue an LLM_GENERATE request for the LLM worker."""
+        request_id = data.get("request_id", "unknown")
+        if not self.llm_worker or not self.llm_queue:
+            await websocket.send(ErrorMessage(
+                request_id=request_id,
+                error="LLM workload is not enabled on this server",
+                recoverable=False,
+                error_code="LLM_NOT_ENABLED",
+            ).to_json())
+            return
+        try:
+            request = LlmGenerateRequest.from_dict(data)
+        except ValidationError as e:
+            await websocket.send(ErrorMessage(
+                request_id=request_id,
+                error=f"Invalid LLM request: {e}",
+                recoverable=False,
+                error_code="VALIDATION_ERROR",
+            ).to_json())
+            return
+
+        # Per-request rate limit — LLM generations are long (minutes); without
+        # this a client could fill the queue behind the global flood limiter.
+        rate_limiter = self._rate_limiters.get(websocket)
+        if rate_limiter:
+            if (rate_limiter.get_request_count(self.config.server.rate_limit_window)
+                    >= self.config.server.rate_limit_requests):
+                await websocket.send(ErrorMessage(
+                    request_id=request.request_id,
+                    error=f"Rate limit exceeded. Max {self.config.server.rate_limit_requests} "
+                          f"requests per {self.config.server.rate_limit_window} seconds.",
+                    recoverable=True,
+                    error_code="RATE_LIMIT_EXCEEDED",
+                ).to_json())
+                return
+            rate_limiter.record_request()
+
+        success = await self.llm_queue.enqueue(request, websocket)
+        if success:
+            await websocket.send(json.dumps({
+                "type": MessageType.QUEUED,
+                "request_id": request.request_id,
+                "queue_size": self.llm_queue.size,
+            }))
+        else:
+            await websocket.send(ErrorMessage(
+                request_id=request.request_id,
+                error="LLM queue is full",
+                recoverable=True,
+                error_code="QUEUE_FULL",
             ).to_json())
 
     async def _handle_binary_frame(self, websocket: WebSocketServerProtocol, data: bytes):

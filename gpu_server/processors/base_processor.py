@@ -132,9 +132,11 @@ class BaseProcessor(ABC):
         # Signal cancellation to any running operations
         self.cancel()
 
-        self._unload_resources()
-
-        # Shutdown the executor with timeout
+        # Drain the executor BEFORE freeing the model. Freeing a model's tensors
+        # while a GPU kernel on the executor thread still references them
+        # corrupts the CUDA context (a process-fatal error) — the same F1 hazard
+        # the resident-model marshalling prevents on the eviction path; shutdown
+        # must honour it too. Only after the executor is idle is unload safe.
         if self._executor is not None:
             logger.info(f"Shutting down {self.processor_name} executor...")
 
@@ -159,3 +161,7 @@ class BaseProcessor(ABC):
                 self._executor.shutdown(wait=False, cancel_futures=True)
 
             self._executor = None
+
+        # Executor is now idle: no kernel is using the model, so freeing its VRAM
+        # cannot race live inference.
+        self._unload_resources()

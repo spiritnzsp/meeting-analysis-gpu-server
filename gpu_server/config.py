@@ -265,6 +265,61 @@ class VideoQueueConfig:
 
 
 @dataclass
+class LlmConfig:
+    """On-device LLM (summarisation) configuration.
+
+    Disabled by default: the LLM workload is opt-in and only runs where a GGUF
+    model and enough VRAM exist. When enabled the server advertises the ``llm``
+    capability and accepts LLM_GENERATE requests. The tuned defaults mirror the
+    app's LlamaCppProvider (Qwen2.5-14B-Q5_K_M on a 16GB card): q8 KV cache +
+    flash attention so a 14B fits ~28K context.
+
+    ``estimated_vram_gb`` is the FULL resident footprint the arbiter reserves:
+    weights + the ENTIRE q8 KV cache (llama.cpp allocates all of n_ctx up front
+    at construction — it does NOT grow during generation) + compute buffers
+    (~13 GB for 14B-Q5 at 28K, measured in trials). ``kv_headroom_gb`` is only a
+    small TRANSIENT scratch margin per request — NOT KV growth, which is already
+    resident above.
+    """
+    enabled: bool = False
+    model_path: str = ""
+    n_ctx: int = 28672
+    n_gpu_layers: int = -1
+    flash_attn: bool = True
+    kv_cache_type: int = 8  # llama_cpp type 8 = Q8_0 KV
+    temperature: float = 0.3
+    max_tokens: int = 4000
+    estimated_vram_gb: float = 13.0        # weights + FULL q8 28K KV + buffers (all resident)
+    kv_headroom_gb: float = 0.5            # small transient per-request scratch margin
+
+    @property
+    def estimated_vram_bytes(self) -> int:
+        return int(self.estimated_vram_gb * 1024 ** 3)
+
+    @property
+    def kv_headroom_bytes(self) -> int:
+        return int(self.kv_headroom_gb * 1024 ** 3)
+
+
+@dataclass
+class LlmQueueConfig:
+    """LLM request queue configuration."""
+    max_size: int = 50
+    request_timeout: int = 1800        # 30 min waiting in queue
+    processing_timeout: int = 600      # 10 min per generation
+
+
+@dataclass
+class GpuConfig:
+    """GPU resource-arbiter configuration."""
+    vram_headroom_gb: float = 1.0  # safety margin the arbiter never hands out
+
+    @property
+    def vram_headroom_bytes(self) -> int:
+        return int(self.vram_headroom_gb * 1024 ** 3)
+
+
+@dataclass
 class Config:
     """Main configuration container."""
     server: ServerConfig = field(default_factory=ServerConfig)
@@ -276,6 +331,9 @@ class Config:
     tls: TLSConfig = field(default_factory=TLSConfig)
     video_encoding: VideoEncodingConfig = field(default_factory=VideoEncodingConfig)
     video_queue: VideoQueueConfig = field(default_factory=VideoQueueConfig)
+    llm: LlmConfig = field(default_factory=LlmConfig)
+    llm_queue: LlmQueueConfig = field(default_factory=LlmQueueConfig)
+    gpu: GpuConfig = field(default_factory=GpuConfig)
 
 
 def load_config(config_path: Optional[Path] = None, fail_on_error: bool = True) -> Config:
@@ -408,6 +466,34 @@ def load_config(config_path: Optional[Path] = None, fail_on_error: bool = True) 
                     processing_timeout=vq.get('processing_timeout', config.video_queue.processing_timeout),
                 )
 
+            if 'llm' in data:
+                llm = data['llm']
+                config.llm = LlmConfig(
+                    enabled=llm.get('enabled', config.llm.enabled),
+                    model_path=llm.get('model_path', config.llm.model_path),
+                    n_ctx=llm.get('n_ctx', config.llm.n_ctx),
+                    n_gpu_layers=llm.get('n_gpu_layers', config.llm.n_gpu_layers),
+                    flash_attn=llm.get('flash_attn', config.llm.flash_attn),
+                    kv_cache_type=llm.get('kv_cache_type', config.llm.kv_cache_type),
+                    temperature=llm.get('temperature', config.llm.temperature),
+                    max_tokens=llm.get('max_tokens', config.llm.max_tokens),
+                    estimated_vram_gb=llm.get('estimated_vram_gb', config.llm.estimated_vram_gb),
+                    kv_headroom_gb=llm.get('kv_headroom_gb', config.llm.kv_headroom_gb),
+                )
+
+            if 'llm_queue' in data:
+                lq = data['llm_queue']
+                config.llm_queue = LlmQueueConfig(
+                    max_size=lq.get('max_size', config.llm_queue.max_size),
+                    request_timeout=lq.get('request_timeout', config.llm_queue.request_timeout),
+                    processing_timeout=lq.get('processing_timeout', config.llm_queue.processing_timeout),
+                )
+
+            if 'gpu' in data:
+                config.gpu = GpuConfig(
+                    vram_headroom_gb=data['gpu'].get('vram_headroom_gb', config.gpu.vram_headroom_gb),
+                )
+
         except Exception as e:
             if fail_on_error:
                 raise ConfigurationError(f"Failed to parse config file '{config_file}': {e}") from e
@@ -436,6 +522,12 @@ def load_config(config_path: Optional[Path] = None, fail_on_error: bool = True) 
     if os.environ.get('HUGGINGFACE_TOKEN'):
         # Read and immediately clear sensitive env var (consistent with API key handling)
         config.pyannote.huggingface_token = os.environ.pop('HUGGINGFACE_TOKEN')
+
+    # LLM environment variable overrides
+    if os.environ.get('GPU_SERVER_LLM_ENABLED'):
+        config.llm.enabled = os.environ['GPU_SERVER_LLM_ENABLED'].lower() in ('true', '1', 'yes')
+    if os.environ.get('GPU_SERVER_LLM_MODEL_PATH'):
+        config.llm.model_path = os.environ['GPU_SERVER_LLM_MODEL_PATH']
 
     # Video encoding environment variable overrides
     if os.environ.get('GPU_SERVER_VIDEO_ENABLED'):
@@ -571,6 +663,18 @@ def validate_config(config: Config, strict: bool = True):
             temp_path = Path(config.video_encoding.temp_directory)
             if not temp_path.exists():
                 warnings.append(f"Video encoding temp_directory does not exist: {temp_path}")
+
+    # LLM validation — catch a misconfigured LLM at startup rather than on the
+    # first request (after a lease acquire and possible eviction).
+    if config.llm.enabled:
+        if not config.llm.model_path:
+            errors.append("llm.enabled is true but llm.model_path is empty")
+        elif not Path(config.llm.model_path).is_file():
+            errors.append(f"llm.model_path does not exist: {config.llm.model_path}")
+        if config.llm.n_ctx < 512:
+            errors.append(f"Invalid llm.n_ctx: {config.llm.n_ctx}. Must be >= 512")
+        if config.llm.estimated_vram_gb <= 0:
+            errors.append(f"Invalid llm.estimated_vram_gb: {config.llm.estimated_vram_gb}. Must be > 0")
 
     # Log warnings
     for warning in warnings:
