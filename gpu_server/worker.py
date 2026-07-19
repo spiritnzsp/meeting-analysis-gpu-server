@@ -24,6 +24,7 @@ from .protocol import (
     ProcessRequest, ProcessingResult, ProgressMessage, ProcessingStage,
     TranscriptSegment, DiarizationSegment, SpeakerEmbedding, ErrorMessage
 )
+from .backoff import ErrorBackoff
 from .processors import WhisperProcessor, PyAnnoteProcessor, ProcessorCancelled
 from .processors.whisper_processor import WHISPER_MODEL_KEY
 from .processors.pyannote_processor import PYANNOTE_MODEL_KEY, PYANNOTE_EMBEDDING_KEY
@@ -74,8 +75,7 @@ class GPUWorker:
         self._current_request: Optional[str] = None
 
         # Exponential backoff for error recovery (prevents log flooding)
-        self._error_backoff_seconds: float = 1.0
-        self._max_error_backoff_seconds: float = 60.0
+        self._backoff = ErrorBackoff()
 
     def residents(self) -> List[ResidentModel]:
         """The arbiter residents this worker owns (whisper + the two pyannote
@@ -123,7 +123,7 @@ class GPUWorker:
                 await self._serve(queued)
 
                 # Reset error backoff on successful request processing
-                self._error_backoff_seconds = 1.0
+                self._backoff.reset()
 
             except asyncio.CancelledError:
                 logger.info("Worker cancelled")
@@ -132,15 +132,9 @@ class GPUWorker:
                 logger.error(
                     f"Worker error: {e}",
                     exc_info=True,
-                    data={'backoff_seconds': self._error_backoff_seconds}
+                    data={'backoff_seconds': self._backoff.current_seconds}
                 )
-                await asyncio.sleep(self._error_backoff_seconds)
-
-                # Exponential backoff: 1s, 2s, 4s, 8s, 16s, 32s, 60s max
-                self._error_backoff_seconds = min(
-                    self._error_backoff_seconds * 2,
-                    self._max_error_backoff_seconds
-                )
+                await self._backoff.sleep()
 
         logger.info("GPU Worker stopped")
 

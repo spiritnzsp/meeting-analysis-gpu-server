@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import time
 
+from .backoff import ErrorBackoff
 from .config import Config
 from .logging_config import get_logger
 from .orchestrator import VramArbiter, WorkloadNeed
@@ -39,8 +40,7 @@ class LlmWorker:
         self._processor = LlmProcessor(self.config.llm)
         self._resident = self._processor.make_resident_model(LLM_MODEL_KEY)
         self._running = False
-        self._error_backoff_seconds = 1.0
-        self._max_error_backoff_seconds = 60.0
+        self._backoff = ErrorBackoff()
 
     def residents(self):
         """The arbiter resident this worker owns (the LLM model). Registered by
@@ -69,16 +69,13 @@ class LlmWorker:
                 if queued.cancelled:
                     continue
                 await self._process(queued)
-                self._error_backoff_seconds = 1.0
+                self._backoff.reset()
             except asyncio.CancelledError:
                 logger.info("LLM worker cancelled")
                 break
             except Exception as e:  # noqa: BLE001 - keep the worker alive
                 logger.error(f"LLM worker loop error: {e}", exc_info=True)
-                await asyncio.sleep(self._error_backoff_seconds)
-                self._error_backoff_seconds = min(
-                    self._error_backoff_seconds * 2, self._max_error_backoff_seconds
-                )
+                await self._backoff.sleep()
 
     async def _process(self, queued):
         request = queued.request

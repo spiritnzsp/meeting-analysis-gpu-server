@@ -176,6 +176,17 @@ class GPUServer:
         # (nothing else requires the 'llm' key, so its later registration is safe).
         self._register_residents()
 
+        # Message dispatch map (RequestRouter): msg_type -> async handler. Adding a
+        # workload is a new entry here, not another elif in _handle_message.
+        self._handlers = {
+            MessageType.PROCESS: self._handle_process_request,
+            MessageType.VIDEO_ENCODE: self._handle_video_encode_request,
+            MessageType.LLM_GENERATE: self._handle_llm_request,
+            MessageType.CANCEL: self._handle_cancel,
+            MessageType.PING: self._handle_ping,
+            "auth": self._handle_redundant_auth,
+        }
+
         self._authenticated_clients: Set[WebSocketServerProtocol] = set()
         self._pending_connections: Set[WebSocketServerProtocol] = set()  # Pre-auth connections
         self._client_info: Dict[WebSocketServerProtocol, dict] = {}
@@ -572,34 +583,11 @@ class GPUServer:
             ).to_json())
             return
 
-        if msg_type == MessageType.PROCESS:
-            await self._handle_process_request(websocket, data)
-
-        elif msg_type == MessageType.VIDEO_ENCODE:
-            await self._handle_video_encode_request(websocket, data)
-
-        elif msg_type == MessageType.LLM_GENERATE:
-            await self._handle_llm_request(websocket, data)
-
-        elif msg_type == MessageType.CANCEL:
-            await self._handle_cancel(websocket, data)
-
-        elif msg_type == MessageType.PING:
-            pong_data = {
-                "type": MessageType.PONG,
-                "queue_size": self.queue.size,
-                "is_processing": self.worker.is_processing,
-            }
-            if self.video_queue:
-                pong_data["video_queue_size"] = self.video_queue.size
-            await websocket.send(json.dumps(pong_data))
-
-        elif msg_type == "auth":
-            # Client sent auth message but already authenticated - ignore silently
-            # This happens when auth is disabled (auto-auth on connect) but client
-            # still sends auth message
-            logger.debug("Ignoring auth message from already-authenticated client")
-
+        # Dispatch via the handler map (RequestRouter) — workloads are additive:
+        # registering a new message type is a dict entry, not another elif.
+        handler = self._handlers.get(msg_type)
+        if handler is not None:
+            await handler(websocket, data)
         else:
             logger.warning(f"Unknown message type: {msg_type}")
             await websocket.send(ErrorMessage(
@@ -607,6 +595,21 @@ class GPUServer:
                 error=f"Unknown message type: {msg_type}",
                 error_code="UNKNOWN_MESSAGE_TYPE",
             ).to_json())
+
+    async def _handle_ping(self, websocket: WebSocketServerProtocol, data: dict):
+        pong_data = {
+            "type": MessageType.PONG,
+            "queue_size": self.queue.size,
+            "is_processing": self.worker.is_processing,
+        }
+        if self.video_queue:
+            pong_data["video_queue_size"] = self.video_queue.size
+        await websocket.send(json.dumps(pong_data))
+
+    async def _handle_redundant_auth(self, websocket: WebSocketServerProtocol, data: dict):
+        # Client sent an auth message but is already authenticated (happens when
+        # auth is disabled and the client still sends one) — ignore silently.
+        logger.debug("Ignoring auth message from already-authenticated client")
 
     async def _handle_llm_request(self, websocket: WebSocketServerProtocol, data: dict):
         """Validate and queue an LLM_GENERATE request for the LLM worker."""
@@ -1047,12 +1050,15 @@ class GPUServer:
 
         set_request_context(request_id=request_id)
 
-        # Try audio queue first, then video queue
+        # Try audio queue first, then video, then LLM (C4 — a queued LLM
+        # generation must be cancellable too, at parity with audio/video).
         success = await self.queue.cancel(request_id)
         if not success and self.video_queue:
             success = await self.video_queue.cancel(request_id)
             if success and self.video_worker:
                 self.video_worker._cleanup_upload(request_id)
+        if not success and self.llm_queue:
+            success = await self.llm_queue.cancel(request_id)
 
         if success:
             await websocket.send(CancelledMessage(request_id=request_id).to_json())

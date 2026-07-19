@@ -17,6 +17,7 @@ from .protocol import (
     VideoEncodeRequest, VideoEncodeResult, ProgressMessage, ProcessingStage,
     ErrorMessage
 )
+from .backoff import ErrorBackoff
 from .orchestrator import VramArbiter, WorkloadNeed
 from .processors.video_encoder import VideoEncoderProcessor
 from .binary_protocol import BinaryFrameType, encode_binary_frame
@@ -84,8 +85,7 @@ class VideoWorker:
         self._timeout_task: Optional[asyncio.Task] = None
 
         # Exponential backoff for error recovery
-        self._error_backoff_seconds: float = 1.0
-        self._max_error_backoff_seconds: float = 60.0
+        self._backoff = ErrorBackoff()
 
     async def start(self) -> None:
         """Start the video worker processing loop."""
@@ -130,18 +130,14 @@ class VideoWorker:
 
                 await self._serve(queued)
 
-                self._error_backoff_seconds = 1.0
+                self._backoff.reset()
 
             except asyncio.CancelledError:
                 logger.info("Video Worker cancelled")
                 break
             except Exception as e:
                 logger.error(f"Video Worker error: {e}", exc_info=True)
-                await asyncio.sleep(self._error_backoff_seconds)
-                self._error_backoff_seconds = min(
-                    self._error_backoff_seconds * 2,
-                    self._max_error_backoff_seconds,
-                )
+                await self._backoff.sleep()
 
         logger.info("Video Worker stopped")
 
