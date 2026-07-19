@@ -30,11 +30,30 @@ from __future__ import annotations
 import asyncio
 import threading
 from concurrent.futures import Executor
+from dataclasses import dataclass
 from typing import Callable, Protocol
 
 from ..logging_config import get_logger
 
 logger = get_logger(__name__)
+
+
+@dataclass(frozen=True)
+class ResidentBinding:
+    """One resident a processor owns: its stable key, its VRAM size, and the
+    blocking load/unload callables (already bound to the processor instance).
+
+    Produced by processors (``resident_bindings()``) and consumed by the arbiter
+    side (``ResidentProcessorHandle`` turns each into a ``ResidentModel``). It
+    lives here beside ``ResidentModel`` — the residency vocabulary — so a
+    processor declaring its residents does not have to import the handle
+    (consumer) module. The processor's own executor is supplied separately, since
+    a single processor's residents all share its one executor."""
+
+    key: str
+    estimated_vram_bytes: int
+    load_fn: Callable[[], None]
+    unload_fn: Callable[[], None]
 
 
 class ManagedModel(Protocol):
@@ -44,6 +63,7 @@ class ManagedModel(Protocol):
 
     key: str
     estimated_vram_bytes: int
+    is_busy: bool  # whether an operation/lease currently holds this model
 
     def is_loaded(self) -> bool: ...
     async def load(self) -> None: ...
@@ -82,6 +102,14 @@ class ResidentModel:
         # model evictable.
         self._op_count = 0
         self._evicting = False
+        # Generation counter, bumped by rebind(). A load/unload dispatched to the
+        # OLD executor before a stuck-timeout recreate may still be running when
+        # rebind() repoints this resident; when that zombie finishes it must NOT
+        # commit its (stale) result onto the rebound resident (CB1). Each
+        # load/unload captures the epoch at dispatch and only commits if it is
+        # unchanged. The load_fn/unload_fn/executor are captured alongside so a
+        # zombie also can't race rebind's reassignment of them.
+        self._epoch = 0
         # Serializes concurrent load() calls so a check-then-dispatch race can't
         # build the model twice on the executor (S4).
         self._load_lock = asyncio.Lock()
@@ -109,17 +137,31 @@ class ResidentModel:
                 return
         async with self._load_lock:
             # Re-check under the load lock: a racing caller may have loaded it
-            # while we waited (S4).
+            # while we waited (S4). Capture the epoch + bound callables/executor
+            # so a rebind mid-load fences this dispatch (CB1).
             with self._lock:
                 if self._loaded:
                     return
+                epoch = self._epoch
+                load_fn = self._load_fn
+                executor = self._executor
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(self._executor, self._load_sync)
+            await loop.run_in_executor(executor, self._load_sync, epoch, load_fn)
 
-    def _load_sync(self) -> None:
+    def _load_sync(self, epoch: int, load_fn: Callable[[], None]) -> None:
         # Executor thread. On failure _loaded stays False so accounting is honest.
-        self._load_fn()
+        load_fn()
         with self._lock:
+            if epoch != self._epoch:
+                # Rebound while this (old-executor) load was running — a zombie.
+                # Do NOT flip _loaded on the rebound resident; its new load_fn
+                # owns residency now. The weights this loaded belong to the old
+                # processor and are freed by its shutdown.
+                logger.warning(
+                    f"Resident model '{self.key}' load from a stale epoch ignored "
+                    "(rebound during load)"
+                )
+                return
             self._loaded = True
         logger.info(f"Resident model '{self.key}' loaded")
 
@@ -140,19 +182,26 @@ class ResidentModel:
                     f"unload('{self.key}') requires an eviction reservation; "
                     "call try_reserve_for_eviction() first"
                 )
+        with self._lock:
+            epoch = self._epoch
+            unload_fn = self._unload_fn
+            executor = self._executor
         loop = asyncio.get_running_loop()
         try:
-            await loop.run_in_executor(self._executor, self._unload_sync)
+            await loop.run_in_executor(executor, self._unload_sync, epoch, unload_fn)
         finally:
             with self._lock:
                 self._evicting = False
 
-    def _unload_sync(self) -> None:
+    def _unload_sync(self, epoch: int, unload_fn: Callable[[], None]) -> None:
         # Executor thread — serialised behind any in-flight inference on this
         # same single-thread executor, which is what makes it safe (F1).
-        self._unload_fn()
+        unload_fn()
         with self._lock:
-            self._loaded = False
+            if epoch == self._epoch:
+                self._loaded = False
+            # else: rebound during unload — rebind() already reset _loaded; the
+            # freed weights were the old processor's. Nothing to commit.
         logger.info(f"Resident model '{self.key}' unloaded")
 
     # --- eviction / operation coordination (F3) ----------------------------
@@ -212,4 +261,8 @@ class ResidentModel:
             self._loaded = False
             self._op_count = 0
             self._evicting = False
+            # Bump the epoch so any load/unload still running on the OLD executor
+            # (a zombie from a timed-out drain) cannot commit its result onto this
+            # rebound resident (CB1).
+            self._epoch += 1
         logger.info(f"Resident model '{self.key}' rebound to a new processor instance")

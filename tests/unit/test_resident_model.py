@@ -4,6 +4,7 @@ Uses a REAL single-thread ThreadPoolExecutor so the load/unload marshalling
 (the F1 safety property: torch teardown must run on the model's own executor,
 never the event loop) is actually exercised, not mocked away.
 """
+import asyncio
 import threading
 
 import pytest
@@ -139,6 +140,42 @@ async def test_load_failure_leaves_model_unloaded(executor):
     with pytest.raises(RuntimeError, match="out of memory"):
         await m.load()
     assert not m.is_loaded()
+
+
+async def test_stale_load_after_rebind_is_fenced(executor):
+    # CB1: a load still running on the OLD executor when rebind() happens (a
+    # zombie from a timed-out drain) must NOT flip _loaded on the rebound
+    # resident — its new load_fn owns residency now.
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_load():
+        started.set()
+        release.wait(2)
+
+    m = _model(executor, load_fn=slow_load)
+    load_task = asyncio.ensure_future(m.load())
+    # Wait until slow_load is actually running on the executor thread.
+    await asyncio.get_running_loop().run_in_executor(None, started.wait, 1)
+
+    new_ex = ThreadPoolExecutor(max_workers=1)
+    try:
+        new_loaded = []
+        m.rebind(new_ex, load_fn=lambda: new_loaded.append(1), unload_fn=lambda: None)
+        assert not m.is_loaded()
+
+        release.set()          # let the stale old-executor load finish
+        await load_task        # completes, but its epoch is stale
+        assert not m.is_loaded()   # fenced: did NOT mark the rebound resident loaded
+        assert new_loaded == []    # and the stale load did not run the new load_fn
+
+        # A fresh load on the rebound resident works normally.
+        await m.load()
+        assert m.is_loaded()
+        assert new_loaded == [1]
+    finally:
+        release.set()
+        new_ex.shutdown(wait=True)
 
 
 async def test_rebind_resets_residency_to_unloaded(executor):

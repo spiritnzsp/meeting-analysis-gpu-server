@@ -50,6 +50,25 @@ class BaseProcessor(ABC):
         """Human-readable processor name for logging."""
         ...
 
+    @property
+    def executor(self) -> Optional[ThreadPoolExecutor]:
+        """The processor's single-thread GPU executor. Used by the arbiter's
+        ResidentModel/handle to marshal load/unload onto the same queue as
+        inference (the F1 safety property). None after shutdown()."""
+        return self._executor
+
+    @staticmethod
+    def _empty_cuda_cache() -> None:
+        """Release cached (freed-but-reserved) GPU blocks back to the driver.
+        The single home for the torch-cleanup idiom shared by every processor's
+        unload path. No-op when torch is absent or CUDA is unavailable."""
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except ImportError:
+            pass
+
     @abstractmethod
     def _unload_resources(self) -> None:
         """Unload models/resources to free GPU memory."""
@@ -137,6 +156,7 @@ class BaseProcessor(ABC):
         # corrupts the CUDA context (a process-fatal error) — the same F1 hazard
         # the resident-model marshalling prevents on the eviction path; shutdown
         # must honour it too. Only after the executor is idle is unload safe.
+        drained = True
         if self._executor is not None:
             logger.info(f"Shutting down {self.processor_name} executor...")
 
@@ -154,6 +174,7 @@ class BaseProcessor(ABC):
             if shutdown_complete.wait(timeout=timeout):
                 logger.info(f"{self.processor_name} executor shutdown complete")
             else:
+                drained = False
                 logger.warning(
                     f"{self.processor_name} executor shutdown timed out after {timeout}s, "
                     "forcing shutdown (operations may still be running)"
@@ -162,6 +183,22 @@ class BaseProcessor(ABC):
 
             self._executor = None
 
-        # Executor is now idle: no kernel is using the model, so freeing its VRAM
-        # cannot race live inference.
-        self._unload_resources()
+        if drained:
+            # Executor is idle: no kernel is using the model, so freeing its VRAM
+            # cannot race live inference.
+            self._unload_resources()
+        else:
+            # The drain TIMED OUT — a GPU kernel may still be running against the
+            # model's tensors. Freeing them now would corrupt the CUDA context
+            # (P1-1), so LEAK the VRAM instead — a leaked model is always safer
+            # than a corrupted (process-fatal) context. Once audio is arbiter-
+            # gated (D2) the arbiter's pessimistic budget (min of driver-free and
+            # our accounting) sees the still-allocated memory via driver-free, so
+            # the leak cannot cause an over-admit. On the un-gated path the leak
+            # is pure loss (a stuck recovery reloads a fresh model alongside it);
+            # still strictly better than the alternative.
+            logger.error(
+                f"{self.processor_name}: executor drain timed out; leaking its "
+                "GPU memory rather than freeing tensors a live kernel may still "
+                "reference (freeing would corrupt the CUDA context)."
+            )

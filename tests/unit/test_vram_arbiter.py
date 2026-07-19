@@ -95,11 +95,12 @@ class FakeClock:
         return self.t
 
 
-def _arbiter(probe=None, headroom_gb=0):
+def _arbiter(probe=None, headroom_gb=0, busy_wait_seconds=1800.0):
     return VramArbiter(
         probe=probe or FakeProbe(total_gb=16),
         headroom_bytes=int(headroom_gb * GB),
         clock=FakeClock(),
+        busy_wait_seconds=busy_wait_seconds,
     )
 
 
@@ -171,15 +172,44 @@ async def test_required_models_are_protected_from_eviction():
         assert c.unload_calls == 1
 
 
-async def test_held_model_is_never_evicted():
-    arb = _arbiter(probe=FakeProbe(total_gb=10))  # tight: forces an eviction attempt
+async def test_held_model_blocks_admission_until_release():
+    # P0-3: two workloads that can't co-reside SERIALIZE — a held model is never
+    # evicted mid-use; the competing admission WAITS and proceeds on release.
+    import asyncio
+    arb = _arbiter(probe=FakeProbe(total_gb=10))  # tight: target can't fit beside held
     held, target = FakeModel("held", 6), FakeModel("target", 6)
     arb.register(held)
     arb.register(target)
-    async with await arb.acquire(WorkloadNeed(required_models=("held",))):  # in use
-        async with await arb.acquire(WorkloadNeed(required_models=("target",))):
-            assert held.unload_calls == 0   # a held model is never torn down
-            assert held.is_loaded()
+    lease = await arb.acquire(WorkloadNeed(required_models=("held",)))  # held in use
+
+    task = asyncio.ensure_future(arb.acquire(WorkloadNeed(required_models=("target",))))
+    await asyncio.sleep(0.05)
+    assert not task.done()          # blocked: held is in use, target can't fit
+    assert held.unload_calls == 0   # held is NOT torn down while in use
+    assert not target.is_loaded()
+
+    lease.release()                 # holder done -> wakes admission, evicts held
+    target_lease = await asyncio.wait_for(task, timeout=2.0)
+    assert held.unload_calls == 1
+    assert target.is_loaded()
+    target_lease.release()
+
+
+async def test_held_backpressure_is_bounded_by_timeout():
+    # A holder that never releases must not wedge admission forever: after
+    # busy_wait_seconds the load is attempted anyway (held still not evicted).
+    arb = _arbiter(probe=FakeProbe(total_gb=10), busy_wait_seconds=0.1)
+    held, target = FakeModel("held", 6), FakeModel("target", 6)
+    arb.register(held)
+    arb.register(target)
+    async with await arb.acquire(WorkloadNeed(required_models=("held",))):
+        lease = await asyncio.wait_for(
+            arb.acquire(WorkloadNeed(required_models=("target",))), timeout=2.0
+        )
+        assert held.unload_calls == 0   # never evicted (still held)
+        assert held.is_loaded()
+        assert target.is_loaded()       # loaded anyway after the wait timed out
+        lease.release()
 
 
 async def test_oom_on_load_triggers_aggressive_evict_and_retry():
@@ -272,6 +302,107 @@ async def test_transient_reservation_forces_eviction():
     async with await arb.acquire(WorkloadNeed(transient_bytes=6 * GB)):
         assert resident.unload_calls == 1  # evicted to fit the transient workload
         assert arb.transient_reserved_bytes == 6 * GB
+
+
+async def test_admission_lock_is_released_while_parked_on_a_held_victim():
+    # BLOCKER-1: the P0-3 held-victim wait must NOT camp on the admission lock.
+    # While one acquire is parked waiting for a held model to free, the arbiter's
+    # admission_barrier() (the same lock, used by stuck-recovery) must still be
+    # obtainable — otherwise recovery deadlocks against the waiter.
+    arb = _arbiter(probe=FakeProbe(total_gb=10))
+    held, target = FakeModel("held", 6), FakeModel("target", 6)
+    arb.register(held)
+    arb.register(target)
+    lease = await arb.acquire(WorkloadNeed(required_models=("held",)))  # in use
+
+    task = asyncio.ensure_future(arb.acquire(WorkloadNeed(required_models=("target",))))
+    await asyncio.sleep(0.05)
+    assert not task.done()  # parked: target can't fit beside the held model
+
+    # The admission lock must be free while the waiter is parked.
+    got_barrier = False
+    async with arb.admission_barrier():
+        got_barrier = True
+    assert got_barrier
+
+    lease.release()
+    target_lease = await asyncio.wait_for(task, timeout=2.0)
+    target_lease.release()
+
+
+async def test_admission_barrier_excludes_acquire():
+    # While the barrier is held, no acquire critical section may run.
+    arb = _arbiter()
+    m = FakeModel("m", 6)
+    arb.register(m)
+    async with arb.admission_barrier():
+        task = asyncio.ensure_future(arb.acquire(WorkloadNeed(required_models=("m",))))
+        await asyncio.sleep(0.05)
+        assert not task.done()      # blocked on the barrier
+        assert m.load_calls == 0    # its critical section never ran
+    lease = await asyncio.wait_for(task, timeout=2.0)
+    assert m.is_loaded()
+    lease.release()
+
+
+async def test_transient_blocks_on_held_model_instead_of_overadmitting():
+    # BLOCKER-2: the transient/video path must also serialize behind a held model
+    # rather than over-reserving past physical capacity.
+    arb = _arbiter(probe=FakeProbe(total_gb=10))
+    held = FakeModel("held", 6)
+    arb.register(held)
+    lease = await arb.acquire(WorkloadNeed(required_models=("held",)))  # 6GB in use
+
+    task = asyncio.ensure_future(arb.acquire(WorkloadNeed(transient_bytes=6 * GB)))
+    await asyncio.sleep(0.05)
+    assert not task.done()                       # blocked: 6GB won't fit beside held
+    assert arb.transient_reserved_bytes == 0     # did NOT over-reserve
+    assert held.unload_calls == 0                # held not torn down while in use
+
+    lease.release()                              # frees the held model
+    tlease = await asyncio.wait_for(task, timeout=2.0)
+    assert held.unload_calls == 1                # evicted on retry
+    assert arb.transient_reserved_bytes == 6 * GB
+    tlease.release()
+
+
+async def test_transient_backpressure_is_bounded_by_timeout():
+    arb = _arbiter(probe=FakeProbe(total_gb=10), busy_wait_seconds=0.1)
+    held = FakeModel("held", 6)
+    arb.register(held)
+    async with await arb.acquire(WorkloadNeed(required_models=("held",))):
+        tlease = await asyncio.wait_for(
+            arb.acquire(WorkloadNeed(transient_bytes=6 * GB)), timeout=2.0
+        )
+        assert held.unload_calls == 0                 # never evicted (still held)
+        assert arb.transient_reserved_bytes == 6 * GB  # reserved anyway after timeout
+        tlease.release()
+
+
+async def test_multi_model_need_rolls_back_partial_holds_when_blocked_then_succeeds():
+    # Corollary to BLOCKER-1: a two-required-model need where the second is
+    # blocked must not leave the first permanently held; on release the whole
+    # attempt retries and succeeds, and no model is left double-held.
+    arb = _arbiter(probe=FakeProbe(total_gb=10))
+    a, b, c = FakeModel("a", 4), FakeModel("b", 4), FakeModel("c", 6)
+    for m in (a, b, c):
+        arb.register(m)
+    lease_c = await arb.acquire(WorkloadNeed(required_models=("c",)))  # c(6) in use
+
+    # Need a+b (8GB). a(4) fits beside c(6)? 10-6=4 -> yes. b(4) then can't (0 left),
+    # blocked by held c. The attempt must roll a's hold back and park.
+    task = asyncio.ensure_future(arb.acquire(WorkloadNeed(required_models=("a", "b"))))
+    await asyncio.sleep(0.05)
+    assert not task.done()
+    assert not a.is_busy      # a's transient hold was rolled back (not left held)
+
+    lease_c.release()         # frees c -> retry evicts c, loads a+b
+    lease_ab = await asyncio.wait_for(task, timeout=2.0)
+    assert a.is_loaded() and b.is_loaded()
+    assert c.unload_calls == 1
+    assert a._op_count == 1 and b._op_count == 1   # each held exactly once
+    lease_ab.release()
+    assert not a.is_busy and not b.is_busy
 
 
 async def test_rebind_via_registry_keeps_accounting_consistent():

@@ -128,13 +128,24 @@ class GPUServer:
         """
         self.config = config
 
-        # Audio queue and worker
+        # VRAM arbiter — the SINGLE admission point for all GPU workloads. Built
+        # unconditionally now that the audio worker is arbiter-gated (Phase D2).
+        # TorchMemoryProbe is lazy (stores an int; no torch import / CUDA context
+        # at construction), so CUDA-less unit tests that never acquire() stay
+        # green; the first (blocking) probe is pre-warmed off the loop in start().
+        from .gpu_info import TorchMemoryProbe
+        from .orchestrator import VramArbiter
+        self.arbiter = VramArbiter(
+            TorchMemoryProbe(), config.gpu.vram_headroom_bytes
+        )
+
+        # Audio queue and worker (gated through the arbiter)
         self.queue = QueueManager(
             max_size=config.queue.max_size,
             request_timeout=config.queue.request_timeout,
             queue_name="audio",
         )
-        self.worker = GPUWorker(config, self.queue)
+        self.worker = GPUWorker(config, self.queue, self.arbiter)
 
         # Video queue and worker (created if enabled)
         self.video_queue: Optional[QueueManager] = None
@@ -145,28 +156,36 @@ class GPUServer:
                 request_timeout=config.video_queue.request_timeout,
                 queue_name="video",
             )
-            self.video_worker = VideoWorker(config, self.video_queue)
+            self.video_worker = VideoWorker(config, self.video_queue, self.arbiter)
 
-        # LLM queue + worker + GPU arbiter (created if enabled). The arbiter is
-        # the single VRAM admission point; today only the LLM worker is routed
-        # through it (audio/video fold in later). Constructing TorchMemoryProbe
-        # is lazy — the first (CUDA-context-creating) probe happens on the first
-        # acquire, off the constructor.
-        self.arbiter = None
+        # LLM queue + worker (created if enabled)
         self.llm_queue: Optional[QueueManager] = None
         self.llm_worker: Optional[LlmWorker] = None
         if config.llm.enabled:
-            from .gpu_info import TorchMemoryProbe
-            from .orchestrator import VramArbiter
-            self.arbiter = VramArbiter(
-                TorchMemoryProbe(), config.gpu.vram_headroom_bytes
-            )
             self.llm_queue = QueueManager(
                 max_size=config.llm_queue.max_size,
                 request_timeout=config.llm_queue.request_timeout,
                 queue_name="llm",
             )
             self.llm_worker = LlmWorker(config, self.llm_queue, self.arbiter)
+
+        # Register every worker's arbiter residents in ONE place, synchronously,
+        # before any worker task can acquire (F9 register-before-acquire). Audio
+        # residents come from the GPUWorker's handles; video has none (transient
+        # VRAM only); the LLM worker registers its own resident in start()
+        # (nothing else requires the 'llm' key, so its later registration is safe).
+        self._register_residents()
+
+        # Message dispatch map (RequestRouter): msg_type -> async handler. Adding a
+        # workload is a new entry here, not another elif in _handle_message.
+        self._handlers = {
+            MessageType.PROCESS: self._handle_process_request,
+            MessageType.VIDEO_ENCODE: self._handle_video_encode_request,
+            MessageType.LLM_GENERATE: self._handle_llm_request,
+            MessageType.CANCEL: self._handle_cancel,
+            MessageType.PING: self._handle_ping,
+            "auth": self._handle_redundant_auth,
+        }
 
         self._authenticated_clients: Set[WebSocketServerProtocol] = set()
         self._pending_connections: Set[WebSocketServerProtocol] = set()  # Pre-auth connections
@@ -177,6 +196,17 @@ class GPUServer:
         self._worker_task = None
         self._video_worker_task = None
         self._llm_worker_task = None
+
+    def _register_residents(self) -> None:
+        """Register ALL arbiter residents synchronously at construction, before any
+        worker task can acquire (F9). Audio (whisper + two pyannote) always; the
+        LLM resident too when the LLM stack is built — one uniform place, no
+        per-worker lazy registration."""
+        for resident in self.worker.residents():
+            self.arbiter.register(resident)
+        if self.llm_worker is not None:
+            for resident in self.llm_worker.residents():
+                self.arbiter.register(resident)
 
     def _build_workloads(self) -> dict:
         """Advertise which workloads this server can perform, so a client can
@@ -219,6 +249,12 @@ class GPUServer:
 
         # Create SSL context if TLS is enabled
         ssl_context = create_ssl_context(self.config.tls)
+
+        # Pre-warm the VRAM probe off the event loop: the first mem_get_info
+        # creates the CUDA context (blocking), and we don't want the first real
+        # admission charged for it or the loop stalled (F9).
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self.arbiter.prewarm)
 
         # Start the audio worker
         self._worker_task = asyncio.create_task(self.worker.start())
@@ -547,34 +583,11 @@ class GPUServer:
             ).to_json())
             return
 
-        if msg_type == MessageType.PROCESS:
-            await self._handle_process_request(websocket, data)
-
-        elif msg_type == MessageType.VIDEO_ENCODE:
-            await self._handle_video_encode_request(websocket, data)
-
-        elif msg_type == MessageType.LLM_GENERATE:
-            await self._handle_llm_request(websocket, data)
-
-        elif msg_type == MessageType.CANCEL:
-            await self._handle_cancel(websocket, data)
-
-        elif msg_type == MessageType.PING:
-            pong_data = {
-                "type": MessageType.PONG,
-                "queue_size": self.queue.size,
-                "is_processing": self.worker.is_processing,
-            }
-            if self.video_queue:
-                pong_data["video_queue_size"] = self.video_queue.size
-            await websocket.send(json.dumps(pong_data))
-
-        elif msg_type == "auth":
-            # Client sent auth message but already authenticated - ignore silently
-            # This happens when auth is disabled (auto-auth on connect) but client
-            # still sends auth message
-            logger.debug("Ignoring auth message from already-authenticated client")
-
+        # Dispatch via the handler map (RequestRouter) — workloads are additive:
+        # registering a new message type is a dict entry, not another elif.
+        handler = self._handlers.get(msg_type)
+        if handler is not None:
+            await handler(websocket, data)
         else:
             logger.warning(f"Unknown message type: {msg_type}")
             await websocket.send(ErrorMessage(
@@ -582,6 +595,21 @@ class GPUServer:
                 error=f"Unknown message type: {msg_type}",
                 error_code="UNKNOWN_MESSAGE_TYPE",
             ).to_json())
+
+    async def _handle_ping(self, websocket: WebSocketServerProtocol, data: dict):
+        pong_data = {
+            "type": MessageType.PONG,
+            "queue_size": self.queue.size,
+            "is_processing": self.worker.is_processing,
+        }
+        if self.video_queue:
+            pong_data["video_queue_size"] = self.video_queue.size
+        await websocket.send(json.dumps(pong_data))
+
+    async def _handle_redundant_auth(self, websocket: WebSocketServerProtocol, data: dict):
+        # Client sent an auth message but is already authenticated (happens when
+        # auth is disabled and the client still sends one) — ignore silently.
+        logger.debug("Ignoring auth message from already-authenticated client")
 
     async def _handle_llm_request(self, websocket: WebSocketServerProtocol, data: dict):
         """Validate and queue an LLM_GENERATE request for the LLM worker."""
@@ -1022,12 +1050,15 @@ class GPUServer:
 
         set_request_context(request_id=request_id)
 
-        # Try audio queue first, then video queue
+        # Try audio queue first, then video, then LLM (C4 — a queued LLM
+        # generation must be cancellable too, at parity with audio/video).
         success = await self.queue.cancel(request_id)
         if not success and self.video_queue:
             success = await self.video_queue.cancel(request_id)
             if success and self.video_worker:
                 self.video_worker._cleanup_upload(request_id)
+        if not success and self.llm_queue:
+            success = await self.llm_queue.cancel(request_id)
 
         if success:
             await websocket.send(CancelledMessage(request_id=request_id).to_json())

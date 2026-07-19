@@ -120,10 +120,13 @@ class ProcessingOptions:
     transcribe: bool = True
     diarize: bool = True
     extract_embeddings: bool = True
-    whisper_model: Optional[str] = None  # Override server default
+    whisper_model: Optional[str] = None  # Override server default (ignored when arbiter-gated; server runs config.whisper.model)
     language: Optional[str] = None  # Force language (null = auto)
     num_speakers: Optional[int] = None  # Hint for diarization
-    hf_token: Optional[str] = None  # Client's HuggingFace token for PyAnnote
+    # DEPRECATED/IGNORED since the audio path is arbiter-gated: the embedding model
+    # is loaded by the arbiter using the server's configured HuggingFace token, so
+    # a client-supplied token is no longer consulted. Kept for wire compatibility.
+    hf_token: Optional[str] = None
 
 
 @dataclass

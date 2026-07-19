@@ -11,8 +11,8 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Optional
 
+from .backoff import ErrorBackoff
 from .config import Config
 from .logging_config import get_logger
 from .orchestrator import VramArbiter, WorkloadNeed
@@ -33,17 +33,21 @@ class LlmWorker:
         self.config = config
         self.queue = queue
         self._arbiter = arbiter
-        self._processor: Optional[LlmProcessor] = None
+        # Build the processor and its resident EAGERLY so the server can register
+        # the resident synchronously at construction, uniformly with the audio
+        # residents (F9 register-before-acquire in one place). LlmProcessor.__init__
+        # only spawns an executor thread — no model load / CUDA at construction.
+        self._processor = LlmProcessor(self.config.llm)
+        self._resident = self._processor.make_resident_model(LLM_MODEL_KEY)
         self._running = False
-        self._error_backoff_seconds = 1.0
-        self._max_error_backoff_seconds = 60.0
+        self._backoff = ErrorBackoff()
+
+    def residents(self):
+        """The arbiter resident this worker owns (the LLM model). Registered by
+        the server alongside the audio residents (F9)."""
+        return [self._resident]
 
     async def start(self):
-        self._processor = LlmProcessor(self.config.llm)
-        # Register the LLM as an arbiter resident so it participates in VRAM
-        # admission/eviction alongside the other workloads (once those are also
-        # arbiter-gated). Registration is synchronous, before the drain loop.
-        self._arbiter.register(self._processor.make_resident_model(LLM_MODEL_KEY))
         self._running = True
         logger.info("LLM worker started")
         await self._run_loop()
@@ -65,16 +69,13 @@ class LlmWorker:
                 if queued.cancelled:
                     continue
                 await self._process(queued)
-                self._error_backoff_seconds = 1.0
+                self._backoff.reset()
             except asyncio.CancelledError:
                 logger.info("LLM worker cancelled")
                 break
             except Exception as e:  # noqa: BLE001 - keep the worker alive
                 logger.error(f"LLM worker loop error: {e}", exc_info=True)
-                await asyncio.sleep(self._error_backoff_seconds)
-                self._error_backoff_seconds = min(
-                    self._error_backoff_seconds * 2, self._max_error_backoff_seconds
-                )
+                await self._backoff.sleep()
 
     async def _process(self, queued):
         request = queued.request
@@ -137,10 +138,12 @@ class LlmWorker:
                 processing_time_seconds=time.time() - t0,
             ))
         except Exception as e:  # noqa: BLE001
+            # Mask internal detail from the client (uniform with the audio/video
+            # workers); the specifics are logged server-side.
             logger.error(f"LLM generation failed: {e}", exc_info=True)
             await self._send(websocket, LlmGenerateResult(
                 request_id=request.request_id, success=False,
-                error_message=str(e),
+                error_message="LLM generation failed",
                 processing_time_seconds=time.time() - t0,
             ))
 

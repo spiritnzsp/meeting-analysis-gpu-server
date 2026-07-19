@@ -113,7 +113,9 @@ async def test_process_failure_sends_unsuccessful_result():
 
     result = json.loads(ws.sent[0])
     assert result["success"] is False
-    assert "boom" in result["error_message"]
+    # Internal detail is masked from the client (logged server-side instead).
+    assert result["error_message"] == "LLM generation failed"
+    assert "boom" not in result["error_message"]
     assert worker._arbiter.lease.exited is True  # lease released even on failure
 
 
@@ -167,9 +169,21 @@ async def test_server_rejects_llm_when_disabled():
 def test_server_has_no_llm_stack_by_default():
     srv = GPUServer(Config())
     assert srv.llm_worker is None
-    assert srv.arbiter is None
     assert srv.llm_queue is None
+    # The arbiter is ALWAYS built now (the audio worker is arbiter-gated), even
+    # with the LLM disabled; only the LLM queue/worker are conditional.
+    assert srv.arbiter is not None
     assert srv._build_workloads()["llm"] is False
+
+
+def test_server_registers_audio_residents():
+    # Audio residents (whisper + the two pyannote keys) are registered with the
+    # arbiter at construction, before any worker task runs (F9).
+    srv = GPUServer(Config())
+    keys = {r.key for r in srv.worker.residents()}
+    assert keys == {"whisper", "pyannote", "pyannote_embedding"}
+    # Registered in the arbiter registry (unknown-required-model would KeyError).
+    assert set(srv.arbiter._registry) >= keys
 
 
 def test_server_builds_llm_stack_when_enabled():
@@ -182,3 +196,8 @@ def test_server_builds_llm_stack_when_enabled():
     caps = srv._build_workloads()
     assert caps["llm"] is True
     assert caps["transcribe"] is True
+    # The LLM resident is registered uniformly at construction, alongside audio
+    # (F9 in one place — not lazily in LlmWorker.start()).
+    assert srv.llm_worker.residents()[0].key == "llm"
+    assert "llm" in srv.arbiter._registry
+    assert {"whisper", "pyannote", "pyannote_embedding", "llm"} <= set(srv.arbiter._registry)
