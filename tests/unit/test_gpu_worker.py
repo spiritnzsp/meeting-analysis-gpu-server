@@ -1,6 +1,7 @@
 """Tests for GPUWorker arbiter gating (D2.2): request-derived workload need,
 _serve acquiring the lease + being the sole result sender, and admission-failure
 handling. Uses fakes — no GPU, no real models."""
+import asyncio
 import json
 from types import SimpleNamespace
 
@@ -134,3 +135,26 @@ async def test_serve_emits_failure_result_when_acquire_raises(worker_factory):
     assert ws.sent, "a failure message must be sent"
     msg = json.loads(ws.sent[-1])
     assert msg.get("error_code") == "PROCESSING_FAILED"
+
+
+async def test_serve_timeout_sends_processing_timeout(worker_factory):
+    # F1: a processing timeout is reported as PROCESSING_TIMEOUT (the prior wire
+    # contract), not a ProcessingResult. The processors are idle here (not wedged),
+    # so no recreate happens; the lease still releases.
+    arb = FakeArbiter()
+    w = worker_factory(arb)
+    w.config.queue.processing_timeout = 0  # force immediate timeout
+
+    async def hang(queued):
+        await asyncio.Event().wait()
+
+    w._process_request = hang
+    ws = FakeWS()
+    queued = SimpleNamespace(request=_request(transcribe=True, diarize=True), websocket=ws)
+    await w._serve(queued)
+
+    assert arb.released
+    assert ws.sent
+    msg = json.loads(ws.sent[-1])
+    assert msg.get("error_code") == "PROCESSING_TIMEOUT"
+    assert msg.get("recoverable") is False

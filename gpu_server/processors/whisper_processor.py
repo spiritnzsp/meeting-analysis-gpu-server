@@ -180,7 +180,6 @@ class WhisperProcessor(BaseProcessor):
             ProcessorCancelled: If processing was cancelled
         """
         self._check_shutdown()
-        self._begin_operation()
 
         # The server is constrained to config.model: a fixed-key arbiter resident
         # can't represent a per-request model swap, so an override is logged and
@@ -195,13 +194,15 @@ class WhisperProcessor(BaseProcessor):
 
         # The model is loaded by the arbiter (the caller holds a lease that
         # requires "whisper"); this processor no longer self-loads — the arbiter
-        # is the single owner of loaded-ness. Fail fast if that contract is broken.
+        # is the single owner of loaded-ness. Fail fast if that contract is broken
+        # — BEFORE _begin_operation so a raise can't leak the idle-tracking flag.
         if not self.is_loaded():
             raise RuntimeError(
                 "Whisper model is not resident — the arbiter lease must require "
                 "'whisper' before transcribe()"
             )
 
+        self._begin_operation()
         loop = asyncio.get_running_loop()
 
         try:

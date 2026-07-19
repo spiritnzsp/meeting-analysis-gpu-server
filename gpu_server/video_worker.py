@@ -17,7 +17,7 @@ from .protocol import (
     VideoEncodeRequest, VideoEncodeResult, ProgressMessage, ProcessingStage,
     ErrorMessage
 )
-from .orchestrator import WorkloadNeed
+from .orchestrator import VramArbiter, WorkloadNeed
 from .processors.video_encoder import VideoEncoderProcessor
 from .binary_protocol import BinaryFrameType, encode_binary_frame
 from .utils.temp_video_file import TempVideoFile
@@ -71,10 +71,10 @@ class VideoWorker:
     - Upload timeout enforcement
     """
 
-    def __init__(self, config: Config, queue: QueueManager, arbiter=None):
+    def __init__(self, config: Config, queue: QueueManager, arbiter: VramArbiter):
         self.config = config
         self.queue = queue
-        # The arbiter reserves the transient NVENC VRAM per encode (wired in D2.3).
+        # The arbiter reserves the transient NVENC VRAM per encode.
         self._arbiter = arbiter
 
         self._encoder: Optional[VideoEncoderProcessor] = None
@@ -452,7 +452,15 @@ class VideoWorker:
         )
         if self._encoder:
             self._encoder.cancel(request_id)
-            await self._encoder.wait_for_idle(30.0)
+            if not await self._encoder.wait_for_idle(30.0):
+                # Best-effort: the encoder isn't an arbiter resident, so the lease
+                # releases regardless. A still-wedged ffmpeg means the transient
+                # NVENC reservation is briefly over-released; the pessimistic
+                # budget (driver-free) covers it — log so it's visible.
+                logger.warning(
+                    "Video encoder did not go idle after cancel; NVENC VRAM may "
+                    "be briefly over-released"
+                )
         task.cancel()
         try:
             await task

@@ -6,7 +6,7 @@ GPU-accelerated speaker diarization and embedding extraction.
 import asyncio
 import math
 from pathlib import Path
-from typing import Optional, List, Dict, Callable, Awaitable, Tuple
+from typing import Optional, List, Dict, Callable, Awaitable
 
 from ..config import PyAnnoteConfig
 from ..protocol import (
@@ -342,16 +342,17 @@ class PyAnnoteProcessor(BaseProcessor):
             ProcessorCancelled: If processing was cancelled
         """
         self._check_shutdown()
-        self._begin_operation()
 
         # The pipeline is loaded by the arbiter (the caller holds a lease that
-        # requires "pyannote"); no self-load — the arbiter owns loaded-ness.
+        # requires "pyannote"); no self-load — the arbiter owns loaded-ness. Check
+        # BEFORE _begin_operation so a raise can't leak the idle-tracking flag.
         if not self.is_pipeline_loaded():
             raise RuntimeError(
                 "PyAnnote pipeline is not resident — the arbiter lease must "
                 "require 'pyannote' before diarize()"
             )
 
+        self._begin_operation()
         loop = asyncio.get_running_loop()
 
         try:

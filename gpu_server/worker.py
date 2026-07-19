@@ -117,7 +117,7 @@ class GPUWorker:
                 queued = await self.queue.wait_for_request()
 
                 if queued.cancelled:
-                    self._handle_queue_cancelled(queued)
+                    await self._handle_queue_cancelled(queued)
                     continue
 
                 await self._serve(queued)
@@ -144,18 +144,18 @@ class GPUWorker:
 
         logger.info("GPU Worker stopped")
 
-    def _handle_queue_cancelled(self, queued: QueuedRequest) -> None:
+    async def _handle_queue_cancelled(self, queued: QueuedRequest) -> None:
         set_request_context(request_id=queued.request.request_id)
         if queued.timeout_expired:
             logger.info(
                 LogEvents.REQUEST_TIMEOUT,
                 data={'stage': 'queue', 'reason': 'queue_timeout'}
             )
-            asyncio.ensure_future(self._send_error(
+            await self._send_error(
                 queued.websocket, queued.request.request_id,
                 "Request timed out while waiting in queue",
                 recoverable=True, error_code="QUEUE_TIMEOUT",
-            ))
+            )
         else:
             logger.info(LogEvents.REQUEST_CANCELLED, data={'stage': 'queue'})
         clear_request_context()
@@ -185,6 +185,8 @@ class GPUWorker:
         processing_timeout = self.config.queue.processing_timeout
 
         try:
+            timed_out = False
+            result: Optional[ProcessingResult] = None
             async with await self._arbiter.acquire(need):
                 task = asyncio.ensure_future(self._process_request(queued))
                 try:
@@ -195,10 +197,20 @@ class GPUWorker:
                         asyncio.shield(task), timeout=processing_timeout
                     )
                 except asyncio.TimeoutError:
-                    result = await self._recover_from_timeout(queued, task)
+                    await self._recover_from_timeout(queued, task)
+                    timed_out = True
             # Lease released here — AFTER any recovery, so no concurrent admission
             # can evict a model mid-teardown.
-            if result is not None:
+            if timed_out:
+                # Preserve the prior wire contract: a processing timeout is
+                # reported as PROCESSING_TIMEOUT (not a ProcessingResult), uniform
+                # with the video worker.
+                await self._send_error(
+                    websocket, request.request_id,
+                    f"Processing timed out after {processing_timeout} seconds",
+                    recoverable=False, error_code="PROCESSING_TIMEOUT",
+                )
+            else:
                 await self._send_result(websocket, request.request_id, result)
         except Exception as e:
             # acquire() can raise (unknown model, forced-load OOM, hold failure);
@@ -211,12 +223,13 @@ class GPUWorker:
 
     async def _recover_from_timeout(
         self, queued: QueuedRequest, task: asyncio.Future
-    ) -> Optional[ProcessingResult]:
+    ) -> None:
         """A processing timeout fired. Cancel the in-flight work, drain it, and
         recreate any wedged processor — all WHILE STILL HOLDING THE LEASE (the
         required models stay held, op_count>0, so a concurrent admission cannot
-        reserve/evict the model being torn down). Returns the request's result if
-        the drain produced one, else None (caller sends a timeout error)."""
+        reserve/evict the model being torn down). The client is told
+        PROCESSING_TIMEOUT by the caller regardless of the drained outcome, which
+        is discarded here."""
         request_id = queued.request.request_id
         set_request_context(request_id=request_id)
         logger.error(
@@ -246,39 +259,19 @@ class GPUWorker:
             async with self._arbiter.admission_barrier():
                 await self._pyannote_handle.recreate()
 
-        result: Optional[ProcessingResult] = None
-        if whisper_idle and pyannote_idle:
-            # Processors honoured the cancel; the task caught ProcessorCancelled
-            # and is producing a (failed) result. Collect it — it is the outcome.
-            try:
-                result = await asyncio.wait_for(task, timeout=5.0)
-            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
-                result = None
-        else:
-            # A processor was recreated; the task's executor future is on the dead
-            # executor. Detach it.
-            task.cancel()
-            try:
-                await task
-            except BaseException:
-                pass
+        # Discard the timed-out request's task outcome — the client gets
+        # PROCESSING_TIMEOUT regardless. If the processors went idle the task has
+        # already finished (result dropped); if we recreated, its executor future
+        # is on the dead executor — either way cancel/await detaches it cleanly.
+        task.cancel()
+        try:
+            await task
+        except BaseException:
+            pass
 
         self._cleanup_gpu_memory()
         self._current_request = None
         clear_request_context()
-
-        if result is None:
-            # F-C: only synthesise a timeout error when the drain produced no real
-            # result (a drain that finished cleanly returned one above).
-            return ProcessingResult(
-                request_id=request_id,
-                success=False,
-                error_message=(
-                    f"Processing timed out after "
-                    f"{self.config.queue.processing_timeout} seconds"
-                ),
-            )
-        return result
 
     async def stop(self):
         """Stop the worker."""

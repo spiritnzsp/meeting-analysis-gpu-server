@@ -187,9 +187,15 @@ class GPUServer:
         self._llm_worker_task = None
 
     def _register_residents(self) -> None:
-        """Register all arbiter residents synchronously at construction (F9)."""
+        """Register ALL arbiter residents synchronously at construction, before any
+        worker task can acquire (F9). Audio (whisper + two pyannote) always; the
+        LLM resident too when the LLM stack is built — one uniform place, no
+        per-worker lazy registration."""
         for resident in self.worker.residents():
             self.arbiter.register(resident)
+        if self.llm_worker is not None:
+            for resident in self.llm_worker.residents():
+                self.arbiter.register(resident)
 
     def _build_workloads(self) -> dict:
         """Advertise which workloads this server can perform, so a client can

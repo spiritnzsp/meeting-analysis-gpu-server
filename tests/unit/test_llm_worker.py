@@ -113,7 +113,9 @@ async def test_process_failure_sends_unsuccessful_result():
 
     result = json.loads(ws.sent[0])
     assert result["success"] is False
-    assert "boom" in result["error_message"]
+    # Internal detail is masked from the client (logged server-side instead).
+    assert result["error_message"] == "LLM generation failed"
+    assert "boom" not in result["error_message"]
     assert worker._arbiter.lease.exited is True  # lease released even on failure
 
 
@@ -194,3 +196,8 @@ def test_server_builds_llm_stack_when_enabled():
     caps = srv._build_workloads()
     assert caps["llm"] is True
     assert caps["transcribe"] is True
+    # The LLM resident is registered uniformly at construction, alongside audio
+    # (F9 in one place — not lazily in LlmWorker.start()).
+    assert srv.llm_worker.residents()[0].key == "llm"
+    assert "llm" in srv.arbiter._registry
+    assert {"whisper", "pyannote", "pyannote_embedding", "llm"} <= set(srv.arbiter._registry)
