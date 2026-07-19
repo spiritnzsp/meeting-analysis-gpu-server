@@ -197,6 +197,30 @@ class GPUServer:
         self._video_worker_task = None
         self._llm_worker_task = None
 
+    def _resolve_whisper_ceiling(self) -> None:
+        """Resolve config.whisper.model as a hardware-clamped CEILING: the
+        configured model capped to the largest whisper the detected GPU can run
+        alongside pyannote+embedding. With the default (large-v3, the biggest
+        model) this yields the largest that fits — capability-aware auto-detection.
+        Runs off-loop (detect_gpu touches CUDA); no GPU → configured model unclamped.
+        The arbiter reservation stays at its construction value (a smaller ceiling
+        just over-reserves — conservative, never OOMs)."""
+        from .gpu_info import detect_gpu
+        from .whisper_models import hardware_ceiling
+        configured = self.config.whisper.model
+        gpu = detect_gpu()
+        total = gpu.total_memory_gb if gpu else None
+        coresident = (self.config.pyannote.estimated_vram_gb
+                      + self.config.pyannote.embedding_estimated_vram_gb)
+        ceiling = hardware_ceiling(configured, total, coresident,
+                                   self.config.gpu.vram_headroom_gb)
+        vram_note = f"{total:.1f} GB VRAM" if total is not None else "VRAM undetected"
+        if ceiling != configured:
+            logger.info(f"Whisper ceiling '{ceiling}' (configured '{configured}', {vram_note})")
+        else:
+            logger.info(f"Whisper ceiling '{ceiling}' ({vram_note})")
+        self.config.whisper.model = ceiling
+
     def _register_residents(self) -> None:
         """Register ALL arbiter residents synchronously at construction, before any
         worker task can acquire (F9). Audio (whisper + two pyannote) always; the
@@ -255,6 +279,9 @@ class GPUServer:
         # admission charged for it or the loop stalled (F9).
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self.arbiter.prewarm)
+        # Resolve the whisper ceiling from detected VRAM (off-loop: detect_gpu
+        # touches CUDA). Before the workers start, so the first request sees it.
+        await loop.run_in_executor(None, self._resolve_whisper_ceiling)
 
         # Start the audio worker
         self._worker_task = asyncio.create_task(self.worker.start())

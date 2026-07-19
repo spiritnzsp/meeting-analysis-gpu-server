@@ -26,6 +26,7 @@ from .protocol import (
 )
 from .backoff import ErrorBackoff
 from .processors import WhisperProcessor, PyAnnoteProcessor, ProcessorCancelled
+from .whisper_models import WhisperModelSwapError
 from .processors.whisper_processor import WHISPER_MODEL_KEY
 from .processors.pyannote_processor import PYANNOTE_MODEL_KEY, PYANNOTE_EMBEDDING_KEY
 from .orchestrator import (
@@ -178,8 +179,16 @@ class GPUWorker:
         need = self._workload_need(request)
         processing_timeout = self.config.queue.processing_timeout
 
+        # Thread the client's raw whisper model choice to the processor BEFORE
+        # acquire, so a cold load builds the requested variant directly (config
+        # model is the ceiling; the processor resolves + caps). Only for transcribe
+        # (mirrors _workload_need); the serial audio worker makes this race-free.
+        if request.options.transcribe:
+            self._whisper.request_model(request.options.whisper_model)
+
         try:
             timed_out = False
+            swap_failed = False
             result: Optional[ProcessingResult] = None
             async with await self._arbiter.acquire(need):
                 task = asyncio.ensure_future(self._process_request(queued))
@@ -193,6 +202,16 @@ class GPUWorker:
                 except asyncio.TimeoutError:
                     await self._recover_from_timeout(queued, task)
                     timed_out = True
+                except WhisperModelSwapError as e:
+                    # A per-request variant swap failed, leaving whisper with no
+                    # model while the arbiter still counts it resident (F-A). The
+                    # task already raised (no drain needed); recreate the processor
+                    # WHILE HOLDING THE LEASE (under the barrier) so rebind clears
+                    # the resident's loaded flag and the next request cold-loads.
+                    logger.error(f"Whisper model swap failed; recreating processor: {e}")
+                    async with self._arbiter.admission_barrier():
+                        await self._whisper_handle.recreate()
+                    swap_failed = True
             # Lease released here — AFTER any recovery, so no concurrent admission
             # can evict a model mid-teardown.
             if timed_out:
@@ -203,6 +222,11 @@ class GPUWorker:
                     websocket, request.request_id,
                     f"Processing timed out after {processing_timeout} seconds",
                     recoverable=False, error_code="PROCESSING_TIMEOUT",
+                )
+            elif swap_failed:
+                await self._send_error(
+                    websocket, request.request_id, "Processing failed",
+                    recoverable=False, error_code="PROCESSING_FAILED",
                 )
             else:
                 await self._send_result(websocket, request.request_id, result)
@@ -466,6 +490,10 @@ class GPUWorker:
                 }
             )
 
+        except WhisperModelSwapError:
+            # Do NOT swallow into a result — propagate so _serve recreates the
+            # desynced processor (F-A). The finally below still clears context.
+            raise
         except ProcessorCancelled:
             processing_time = time.time() - start_time
             logger.info(
