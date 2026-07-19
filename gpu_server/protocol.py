@@ -398,6 +398,7 @@ class LlmGenerateResult:
     text: str = ""
     finish_reason: str = ""        # "stop" | "length" | ""
     error_message: str = ""
+    error_code: str = ""           # e.g. "CONTEXT_TOO_LONG" (additive; old clients ignore it)
     processing_time_seconds: float = 0.0
 
     def to_json(self) -> str:
@@ -408,6 +409,7 @@ class LlmGenerateResult:
             "text": self.text,
             "finish_reason": self.finish_reason,
             "error_message": self.error_message,
+            "error_code": self.error_code,
             "processing_time_seconds": self.processing_time_seconds,
         })
 
@@ -419,6 +421,7 @@ class LlmGenerateResult:
             text=str(data.get("text", "")),
             finish_reason=str(data.get("finish_reason", "")),
             error_message=str(data.get("error_message", "")),
+            error_code=str(data.get("error_code", "")),
             processing_time_seconds=float(data.get("processing_time_seconds", 0.0)),
         )
 

@@ -17,7 +17,7 @@ from .config import Config
 from .logging_config import get_logger
 from .orchestrator import VramArbiter, WorkloadNeed
 from .processors import ProcessorCancelled
-from .processors.llm_processor import LlmProcessor
+from .processors.llm_processor import LlmProcessor, PromptTooLongError
 from .protocol import LlmGenerateResult
 from .queue_manager import QueueManager
 
@@ -135,6 +135,16 @@ class LlmWorker:
             await self._send(websocket, LlmGenerateResult(
                 request_id=request.request_id, success=False,
                 error_message="Generation cancelled",
+                processing_time_seconds=time.time() - t0,
+            ))
+        except PromptTooLongError as e:
+            # INPUT too long — report the real reason + a distinct error_code so
+            # the client can chunk/re-split (NOT the generic mask below). This is
+            # actionable to the caller, unlike an internal failure.
+            logger.warning(f"LLM prompt too long: {e}")
+            await self._send(websocket, LlmGenerateResult(
+                request_id=request.request_id, success=False,
+                error_message=str(e), error_code="CONTEXT_TOO_LONG",
                 processing_time_seconds=time.time() - t0,
             ))
         except Exception as e:  # noqa: BLE001
