@@ -21,6 +21,7 @@ logger = get_logger(__name__)
 from . import ProcessorCancelled
 from .base_processor import BaseProcessor
 from ..orchestrator.resident_model import ResidentBinding
+from ..whisper_models import resolve_effective, WhisperModelSwapError
 
 WHISPER_MODEL_KEY = "whisper"
 
@@ -48,6 +49,12 @@ class WhisperProcessor(BaseProcessor):
         super().__init__(thread_name_prefix="whisper_gpu")
         self.config = config
         self._model = None
+        # Which variant is currently loaded, and the variant the NEXT cold load
+        # should build (threaded by the worker before acquire, so a cold load
+        # builds the requested variant directly instead of loading the ceiling
+        # then swapping down). config.model is the CEILING; any variant is ≤ it.
+        self._model_name: Optional[str] = None
+        self._pending_model: Optional[str] = None
 
     @property
     def processor_name(self) -> str:
@@ -72,36 +79,60 @@ class WhisperProcessor(BaseProcessor):
     def is_loaded(self) -> bool:
         return self._model is not None
 
+    def request_model(self, requested: Optional[str]) -> None:
+        """Thread the client-requested model to the NEXT cold load. The RAW
+        request is passed (the processor owns the ceiling/resolve). Set by the
+        (serial) audio worker before acquire; a cold load builds the resolved
+        variant directly, avoiding a load-ceiling-then-swap double load."""
+        self._pending_model = requested
+
     def _unload_resources(self) -> None:
         """Unload the model to free GPU memory."""
         if self._model is not None:
             del self._model
             self._model = None
+            self._model_name = None
             logger.info("Whisper model unloaded")
             self._empty_cuda_cache()
 
+    def _build_model(self, name: str):
+        from faster_whisper import WhisperModel
+        logger.info(f"Loading Whisper model: {name}")
+        model = WhisperModel(name, device=self.config.device,
+                             compute_type=self.config.compute_type)
+        logger.info(f"Whisper model loaded: {name}")
+        return model
+
     def _load_model_sync(self) -> None:
-        """Load the configured Whisper model (blocking; runs on the executor
-        thread). Idempotent. Constrained to ``config.model`` — a fixed-key
-        arbiter resident cannot represent "which model is resident", so the
-        per-request override capability is deliberately dropped."""
+        """Cold load (blocking; runs on the executor). Builds the resolved variant
+        of the pending request, capped at the ceiling (config.model). Idempotent."""
         if self._model is not None:
             return  # Already loaded
-
+        target = resolve_effective(self._pending_model, self.config.model)
         try:
-            from faster_whisper import WhisperModel
-
-            logger.info(f"Loading Whisper model: {self.config.model}")
-            self._model = WhisperModel(
-                self.config.model,
-                device=self.config.device,
-                compute_type=self.config.compute_type,
-            )
-            logger.info(f"Whisper model loaded: {self.config.model}")
-
+            self._model = self._build_model(target)
+            self._model_name = target
         except Exception as e:
             logger.error(f"Failed to load Whisper model: {e}")
             raise
+
+    def _swap_sync(self, target: str) -> None:
+        """Swap the loaded variant to ``target`` as ONE executor task (F-D):
+        unload the current model FIRST (peak VRAM ≤ the ceiling reservation), then
+        build the target. On a build failure the processor is left with NO model —
+        raise WhisperModelSwapError so the worker recreates it (the arbiter still
+        counts whisper resident, so it won't reload on its own: F-A)."""
+        if self._model is not None:
+            del self._model
+            self._model = None
+            self._model_name = None
+            self._empty_cuda_cache()
+        try:
+            self._model = self._build_model(target)
+            self._model_name = target
+        except Exception as e:
+            logger.error(f"Whisper model swap to '{target}' failed: {e}")
+            raise WhisperModelSwapError(str(e)) from e
 
     def _transcribe_sync(
         self,
@@ -181,21 +212,14 @@ class WhisperProcessor(BaseProcessor):
         """
         self._check_shutdown()
 
-        # The server is constrained to config.model: a fixed-key arbiter resident
-        # can't represent a per-request model swap, so an override is logged and
-        # ignored rather than silently running the resident model under a
-        # different name. (Key-per-variant would need dynamic registration, which
-        # breaks the register-before-acquire invariant.)
-        if model_override and model_override != self.config.model:
-            logger.warning(
-                f"Ignoring whisper model_override='{model_override}'; server is "
-                f"constrained to config.model='{self.config.model}'"
-            )
+        # config.model is the CEILING: honour a smaller requested model, pin a
+        # bigger one to the ceiling.
+        effective = resolve_effective(model_override, self.config.model)
 
         # The model is loaded by the arbiter (the caller holds a lease that
-        # requires "whisper"); this processor no longer self-loads — the arbiter
-        # is the single owner of loaded-ness. Fail fast if that contract is broken
-        # — BEFORE _begin_operation so a raise can't leak the idle-tracking flag.
+        # requires "whisper"); this processor does not self-load. Fail fast if
+        # that contract is broken — BEFORE _begin_operation so a raise can't leak
+        # the idle-tracking flag.
         if not self.is_loaded():
             raise RuntimeError(
                 "Whisper model is not resident — the arbiter lease must require "
@@ -206,6 +230,15 @@ class WhisperProcessor(BaseProcessor):
         loop = asyncio.get_running_loop()
 
         try:
+            # If the resident variant differs from the requested one (a warm
+            # resident from a prior request wanting a different model), swap it —
+            # ONE executor task, under the held lease (op_count>0 → the arbiter
+            # can't evict whisper), VRAM peak ≤ the fixed ceiling reservation. The
+            # arbiter's residency accounting is unchanged (a whisper IS loaded); a
+            # swap FAILURE raises WhisperModelSwapError → the worker recreates the
+            # processor to resync (F-A).
+            if self._model_name != effective:
+                await loop.run_in_executor(self._executor, self._swap_sync, effective)
             # Write audio to temp file with robust cleanup (faster-whisper needs file path)
             with TempAudioFile(audio_data, suffix=".opus") as audio_path:
                 try:

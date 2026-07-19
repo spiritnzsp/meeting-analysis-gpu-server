@@ -137,6 +137,67 @@ async def test_serve_emits_failure_result_when_acquire_raises(worker_factory):
     assert msg.get("error_code") == "PROCESSING_FAILED"
 
 
+async def test_serve_threads_whisper_model_before_acquire(worker_factory):
+    # The client's raw model choice is threaded to the processor BEFORE acquire,
+    # only for transcribe requests.
+    arb = FakeArbiter()
+    w = worker_factory(arb)
+    threaded = []
+    w._whisper.request_model = lambda m: threaded.append(m)
+
+    async def fake_process(queued):
+        return ProcessingResult(request_id="r", success=True)
+
+    w._process_request = fake_process
+    ws = FakeWS()
+    req = _request(transcribe=True)
+    req.options.whisper_model = "medium"
+    await w._serve(SimpleNamespace(request=req, websocket=ws))
+    assert threaded == ["medium"]
+
+    # A non-transcribe (diarize-only) request must NOT thread a model.
+    threaded.clear()
+    req2 = _request(diarize=True)
+    req2.options.whisper_model = "medium"
+    await w._serve(SimpleNamespace(request=req2, websocket=FakeWS()))
+    assert threaded == []
+
+
+async def test_serve_recreates_processor_on_swap_failure(worker_factory):
+    from gpu_server.whisper_models import WhisperModelSwapError
+
+    class _Barrier:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    arb = FakeArbiter()
+    arb.admission_barrier = lambda: _Barrier()
+    w = worker_factory(arb)
+
+    recreated = []
+
+    async def fake_recreate():
+        recreated.append(True)
+
+    w._whisper_handle.recreate = fake_recreate
+
+    async def raising_process(queued):
+        raise WhisperModelSwapError("swap boom")
+
+    w._process_request = raising_process
+    ws = FakeWS()
+    await w._serve(SimpleNamespace(request=_request(transcribe=True), websocket=ws))
+
+    # F-A: the desynced processor is recreated (under the barrier) and the client
+    # gets a failure result, not a hang.
+    assert recreated == [True]
+    assert arb.released  # lease still released
+    assert json.loads(ws.sent[-1]).get("error_code") == "PROCESSING_FAILED"
+
+
 async def test_serve_timeout_sends_processing_timeout(worker_factory):
     # F1: a processing timeout is reported as PROCESSING_TIMEOUT (the prior wire
     # contract), not a ProcessingResult. The processors are idle here (not wedged),
