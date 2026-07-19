@@ -105,6 +105,20 @@ async def test_process_success_sends_llm_result():
     assert worker._arbiter.lease.exited is True
 
 
+async def test_prompt_too_long_reports_context_too_long_code():
+    # An INPUT-too-long failure is reported with the REAL reason + a distinct
+    # error_code (not the generic mask) so the client can chunk/re-split.
+    from gpu_server.processors.llm_processor import PromptTooLongError
+    worker = _worker(FakeProcessor(raises=PromptTooLongError("Prompt is too long (40000 vs 28672)")))
+    ws = FakeWS()
+    req = LlmGenerateRequest(request_id="r3", system_prompt="s", user_prompt="u")
+    await worker._process(FakeQueued(req, ws))
+    result = json.loads(ws.sent[0])
+    assert result["success"] is False
+    assert result["error_code"] == "CONTEXT_TOO_LONG"
+    assert "too long" in result["error_message"].lower()  # un-masked
+
+
 async def test_process_failure_sends_unsuccessful_result():
     worker = _worker(FakeProcessor(raises=RuntimeError("boom")))
     ws = FakeWS()

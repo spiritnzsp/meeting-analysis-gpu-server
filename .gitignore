@@ -74,3 +74,6 @@ models/
 *.tmp
 *.temp
 config.local-llm.yaml
+
+# local config backups (may contain secrets)
+*.bak

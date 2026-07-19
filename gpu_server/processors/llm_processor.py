@@ -29,6 +29,13 @@ from .base_processor import BaseProcessor
 logger = get_logger(__name__)
 
 
+class PromptTooLongError(RuntimeError):
+    """The prompt does not fit the model's context window (INPUT too long). A
+    typed exception (not a bare RuntimeError) so the worker can report it with a
+    distinct error_code, letting the client re-split/chunk rather than treating it
+    as a generic failure."""
+
+
 class LlmProcessor(BaseProcessor):
     """llama.cpp-backed text generation processor."""
 
@@ -155,7 +162,7 @@ class LlmProcessor(BaseProcessor):
         prompt_tokens = self._count_prompt_tokens(system_prompt, user_prompt)
         room = self._config.n_ctx - prompt_tokens - 64
         if room < 256:
-            raise RuntimeError(
+            raise PromptTooLongError(
                 f"Prompt is too long for the model's context "
                 f"({prompt_tokens} tokens vs n_ctx={self._config.n_ctx})"
             )
