@@ -98,8 +98,28 @@ class CodecCapabilities:
 
         for codec in preferred_order:
             if codec in self._available_codecs:
+                if requested:
+                    # A client that names a codec has a reason -- compatibility
+                    # with whoever opens the file, usually. Falling through to
+                    # our own preference is the right behaviour (better than
+                    # refusing to encode), but doing it silently is not: the
+                    # substitution reaches the client only as `codec_used` in
+                    # the response, which nothing was reading. Say it here too,
+                    # so the server's own log explains a format the user did not
+                    # choose.
+                    logger.warning(
+                        "Client requested codec %r which this server does not "
+                        "offer (available: %s); encoding with %r instead",
+                        requested, ", ".join(self._available_codecs) or "none", codec,
+                    )
                 return codec
 
+        if requested:
+            logger.warning(
+                "Client requested codec %r and no configured fallback is "
+                "available (available: %s)",
+                requested, ", ".join(self._available_codecs) or "none",
+            )
         return None
 
 
