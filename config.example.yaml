@@ -48,10 +48,17 @@ pyannote:
   # Device: cuda, cpu
   device: "cuda"
   # HuggingFace token (required - get from https://huggingface.co/settings/tokens)
-  # Must accept license at: https://huggingface.co/pyannote/speaker-diarization-3.1
+  # Must accept the licence at:
+  #   https://huggingface.co/pyannote/speaker-diarization-community-1
+  # on the account this token belongs to. The server uses its OWN token; a
+  # client never supplies one.
   huggingface_token: "hf_YOUR_TOKEN_HERE"
-  # Diarization model
-  model: "pyannote/speaker-diarization-3.1"
+  # Diarization model. MUST MATCH THE CLIENT'S PIPELINE, or the same recording
+  # diarised here and locally goes through two different models and the results
+  # are not comparable. The client pins this in
+  # teams_scanner/models/gated_models.py (PRIMARY_PIPELINE), and the value below
+  # is published in the auth handshake so a client can check rather than assume.
+  model: "pyannote/speaker-diarization-community-1"
 
 logging:
   # Log level: DEBUG, INFO, WARNING, ERROR

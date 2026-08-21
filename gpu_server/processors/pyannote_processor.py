@@ -28,6 +28,25 @@ PYANNOTE_MODEL_KEY = "pyannote"
 PYANNOTE_EMBEDDING_KEY = "pyannote_embedding"
 
 
+def _looks_like_gated_access(error: Exception) -> bool:
+    """Whether a load failure is an unaccepted licence rather than a fault.
+
+    Matched on the text because that is all the exception carries: pyannote
+    wraps the HTTP failure and re-raises something generic. Deliberately narrow
+    — a false positive would tell someone to accept a licence they have already
+    accepted, and send them looking in the wrong place for a real network
+    problem.
+    """
+    text = f"{type(error).__name__}: {error}".lower()
+    # HuggingFace's own wording, not a guess at it: "is restricted" is what a
+    # gated repo actually says, and a first pass without it missed the most
+    # common phrasing of the exact failure this exists to explain.
+    gated_signals = ("401", "403", "unauthorized", "forbidden",
+                     "gated", "is restricted", "awaiting a review",
+                     "accept the conditions")
+    return any(signal in text for signal in gated_signals)
+
+
 class PyAnnoteProcessor(BaseProcessor):
     """
     PyAnnote speaker diarization processor.
@@ -160,7 +179,22 @@ class PyAnnoteProcessor(BaseProcessor):
             logger.info("PyAnnote pipeline loaded")
 
         except Exception as e:
+            # Say what to DO about it. A gated-model refusal arrives as a
+            # generic exception mentioning 401/403, and on the client side that
+            # exact shape once produced an error blaming HuggingFace while
+            # HuggingFace was working perfectly — the reader is left to guess
+            # that a licence needs accepting, on which account, and where.
             logger.error(f"Failed to load PyAnnote pipeline: {e}")
+            if _looks_like_gated_access(e):
+                logger.error(
+                    "This looks like a gated-model refusal, not a network "
+                    "fault. %s requires the licence to be accepted on the "
+                    "HuggingFace account that issued THIS SERVER's token — the "
+                    "server never uses a client's token. Open "
+                    "https://huggingface.co/%s while signed in as that account "
+                    "and accept the conditions, then restart the server.",
+                    self.config.model, self.config.model,
+                )
             raise
 
     def _ensure_embedding_model_sync(self):

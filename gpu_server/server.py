@@ -477,6 +477,7 @@ class GPUServer:
                 "video_encoding_enabled": self.config.video_encoding.enabled,
                 "transfer_capabilities": self._build_transfer_capabilities(),
                 "workloads": self._build_workloads(),
+                "diarisation_model": self.config.pyannote.model,
             }))
             logger.info(LogEvents.CLIENT_AUTHENTICATED, data={'auth_disabled': True})
             return True
@@ -542,6 +543,7 @@ class GPUServer:
                 "video_encoding_enabled": self.config.video_encoding.enabled,
                 "transfer_capabilities": self._build_transfer_capabilities(),
                 "workloads": self._build_workloads(),
+                "diarisation_model": self.config.pyannote.model,
             }))
 
             logger.info(

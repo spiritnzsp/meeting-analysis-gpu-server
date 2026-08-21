@@ -1,7 +1,12 @@
 # Model negotiation — negotiate and refuse, never mutate
 
-**Status:** decided in principle 2026-08-10, not implemented. Banked during the
-build-F test pass so the reasoning survives to the triage.
+**Status:** ✅ **IMPLEMENTED 2026-08-21**, both halves — see "What landed" at the
+end. Decided in principle 2026-08-10 and banked during the build-F test pass so
+the reasoning would survive to the triage; it did.
+
+⚠️ **One step is NOT code and is outstanding:** the running server's
+`config.yaml` still pins `speaker-diarization-3.1`, and it overrides the code
+default. See "What is still to do".
 
 **The one-line rule: the server never accepts executable content from a client.**
 
@@ -90,3 +95,64 @@ Small, and independent of the negotiation work: the server already runs
 ⚠️ **Not during a test pass.** Client results are bound to current server
 behaviour and E3's GPU-half comparison would silently change meaning. Server
 config changes wait for the same gap as a client build.
+
+
+---
+
+## What landed, 2026-08-21
+
+**Server (this repo).**
+
+* The pin moves to `pyannote/speaker-diarization-community-1` in both
+  `PyAnnoteConfig` and `config.example.yaml`. community-1 is **self-contained**
+  under pyannote 4.x — its segmentation, embedding and PLDA components live in
+  subfolders of that one repo, unlike the 3.x pipelines which pulled a
+  separately gated segmentation model — so this needs terms accepted on exactly
+  one repo, not several.
+* **The server publishes `diarisation_model` in the `auth_ok` handshake**, on
+  both auth paths. Aligning the pins today is a one-off; publishing is what
+  stops the *next* divergence being silent, which is the part worth having.
+* A gated-model refusal now says what to do about it. It arrives as a generic
+  exception mentioning 401/403, and on the client side that exact shape once
+  produced an error blaming HuggingFace while HuggingFace was working perfectly.
+  The message names the model, says the licence must be accepted **on the
+  account that issued this server's token** — the server never uses a client's —
+  and gives the URL. The matcher is deliberately narrow: a false positive sends
+  someone to accept a licence they already hold and away from the real fault.
+
+**Client (`Meeting_analysis`).** Reads the field, compares it against its own
+`PRIMARY_PIPELINE`, and on a mismatch **proceeds with a loud warning** plus a
+recorded `diarisation_model` provenance field in the transcript, rather than
+refusing and falling back to local.
+
+Sean's decision, and the reasoning is the part to keep: *"impact on the user who
+is actually trying to get work done — diarisation on a slow CPU could cause a lot
+of grief. Better to have this fast with the warning, then the user can redo
+diarisation at a later time if necessary."* **Refusing is only "safe" if you
+ignore what refusing costs**: on the no-GPU laptop this product targets, falling
+back turns a two-minute job into a forty-five-minute one, to avoid a mismatch the
+user can simply re-run.
+
+Which is exactly why the provenance field is not optional. "Proceed anyway"
+without recording *what produced the result* would recreate the confounded
+evidence this whole item is about.
+
+A server that omits the field reads as **"did not say"**, never as disagreement —
+every server built before today omits it.
+
+## What is still to do
+
+1. **Accept the licence for `pyannote/speaker-diarization-community-1` on the
+   HuggingFace account that issued the server's token.** Do this FIRST. The
+   server uses its own token, so accepting it on the client's account achieves
+   nothing.
+2. **Then** change `pyannote.model` in the live `config.yaml` — it currently
+   pins `speaker-diarization-3.1` and **overrides the code default**, so nothing
+   above changes what the running server loads until it is edited.
+3. `systemctl --user restart gpu-server`, and confirm the journal says
+   `Loading PyAnnote pipeline: pyannote/speaker-diarization-community-1`.
+
+Until then the client will report *"Diarised on the GPU server using
+`pyannote/speaker-diarization-3.1`, but this project expects
+`…community-1`"* — which is the honest state, and already better than the silence
+it replaces.

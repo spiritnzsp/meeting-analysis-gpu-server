@@ -240,7 +240,22 @@ class PyAnnoteConfig:
     """PyAnnote diarization configuration."""
     device: str = "cuda"
     huggingface_token: str = ""
-    model: str = "pyannote/speaker-diarization-3.1"
+    # Matches the CLIENT's pinned pipeline. They diverged: the server pinned
+    # 3.1 while the client moved to community-1, and nothing compared them — so
+    # the same recording diarised in the two places went through two different
+    # models while the user was told about one. Every GPU-versus-local
+    # comparison was confounded by it (E3 saw 11-12 speakers on the server
+    # against a constrained 5 locally, and we blamed the range).
+    #
+    # community-1 is SELF-CONTAINED under pyannote 4.x: its segmentation,
+    # embedding and PLDA components live in subfolders of this one repo, unlike
+    # the 3.x pipelines which pulled a separately gated segmentation model. So
+    # this needs terms accepted on exactly one repo, on the SERVER's own
+    # HuggingFace account — the server never uses a client's token.
+    #
+    # The value is published in the auth_ok handshake, so a client can see what
+    # is actually running rather than assuming.
+    model: str = "pyannote/speaker-diarization-community-1"
     # Two independently-evictable residents: the diarization pipeline (~2 GB) and
     # the speaker-embedding model (~0.5 GB, loaded only when embeddings are
     # requested). Sized separately so evicting one does not over/under-account
