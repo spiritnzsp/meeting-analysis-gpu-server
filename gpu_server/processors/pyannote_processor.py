@@ -28,6 +28,62 @@ PYANNOTE_MODEL_KEY = "pyannote"
 PYANNOTE_EMBEDDING_KEY = "pyannote_embedding"
 
 
+def _diagnose_access_failure(token: str, model: str) -> str:
+    """Say WHY access failed, by asking rather than inferring.
+
+    A revoked token and an unaccepted licence both surface as
+    ``GatedRepoError: 401`` — verified on 2026-08-21 against a real revoked
+    token, which is how this function came to exist. The first version of the
+    message here simply said "accept the licence", which would have sent someone
+    to accept a licence they already held while the actual problem was a dead
+    token. That is the same one-message-two-causes defect this project keeps
+    finding, and it was an hour old.
+
+    So the token is checked directly. ``whoami`` is one cheap call and it
+    separates the two cleanly — and when the token IS good it yields the account
+    name, which answers the question "on which account?" definitively instead of
+    leaving the reader to work it out.
+    """
+    try:
+        from huggingface_hub import HfApi
+    except ImportError:             # pragma: no cover - hub is a hard dependency
+        return (
+            "Could not check the token (huggingface_hub unavailable). Verify "
+            f"that this server's token is valid and that the licence for {model} "
+            "is accepted on the account that issued it."
+        )
+
+    if not token:
+        return (
+            "This server has NO HuggingFace token configured. Set "
+            "pyannote.huggingface_token in config.yaml (or the "
+            "HUGGINGFACE_TOKEN environment variable) to a token from the "
+            f"account that has accepted the licence for {model}."
+        )
+
+    try:
+        who = HfApi().whoami(token=token)
+    except Exception as token_error:  # noqa: BLE001 - any failure means unusable
+        return (
+            "THIS SERVER'S HUGGINGFACE TOKEN IS NOT VALID "
+            f"({type(token_error).__name__}: {token_error}). It has most likely "
+            "been revoked or rotated. Accepting a licence will NOT help: issue a "
+            "new token at https://huggingface.co/settings/tokens, on the account "
+            f"that has accepted {model}, and put it in config.yaml. Note that "
+            "models already downloaded keep working from the cache, so this can "
+            "stay hidden until something new has to be fetched."
+        )
+
+    account = who.get("name", "<unknown>")
+    return (
+        f"The token is valid (account '{account}'), so this is a LICENCE "
+        f"problem, not an authentication one. Open "
+        f"https://huggingface.co/{model} while signed in as '{account}' and "
+        "accept the conditions, then restart the server. The server uses its "
+        "own token — accepting it on any other account does nothing."
+    )
+
+
 def _looks_like_gated_access(error: Exception) -> bool:
     """Whether a load failure is an unaccepted licence rather than a fault.
 
@@ -186,14 +242,15 @@ class PyAnnoteProcessor(BaseProcessor):
             # that a licence needs accepting, on which account, and where.
             logger.error(f"Failed to load PyAnnote pipeline: {e}")
             if _looks_like_gated_access(e):
+                # Not a network fault. Which of the two causes it is cannot be
+                # read off the exception -- a revoked token and an unaccepted
+                # licence both arrive as GatedRepoError 401 -- so ask.
                 logger.error(
-                    "This looks like a gated-model refusal, not a network "
-                    "fault. %s requires the licence to be accepted on the "
-                    "HuggingFace account that issued THIS SERVER's token — the "
-                    "server never uses a client's token. Open "
-                    "https://huggingface.co/%s while signed in as that account "
-                    "and accept the conditions, then restart the server.",
-                    self.config.model, self.config.model,
+                    "Model access refused for %s. %s",
+                    self.config.model,
+                    _diagnose_access_failure(
+                        self.config.huggingface_token, self.config.model
+                    ),
                 )
             raise
 

@@ -112,14 +112,95 @@ class TestAGatedRefusalSaysWhatToDoAboutIt:
         and away from the actual problem."""
         assert not self._matcher()(Exception(message))
 
-    def test_the_advice_names_the_server_s_own_account(self):
+    def test_the_advice_is_about_the_server_s_own_token(self, monkeypatch):
         """The trap: the server uses its OWN token and never a client's, so
-        'accept the licence' is useless without saying on which account."""
-        source = inspect.getsource(
-            __import__(
-                "gpu_server.processors.pyannote_processor",
-                fromlist=["pyannote_processor"],
-            )
+        'accept the licence' is useless without saying on which account.
+
+        Asserted on the MESSAGE rather than on the source text. An earlier
+        version of this test matched literal strings in the module, and it broke
+        the moment the message was improved — testing the wording of a comment
+        rather than the behaviour it describes.
+        """
+        class _Api:
+            def whoami(self, token=None):
+                return {"name": "sean-server-bot"}
+
+        monkeypatch.setattr("huggingface_hub.HfApi", _Api)
+
+        from gpu_server.processors.pyannote_processor import (
+            _diagnose_access_failure,
         )
-        assert "THIS SERVER's token" in source
-        assert "never uses a client's token" in source
+        message = _diagnose_access_failure("hf_good", "pyannote/some-model")
+
+        assert "own token" in message
+        assert "any other account does nothing" in message
+
+
+class TestItSaysWHICHAccessProblemItIs:
+    """A revoked token and an unaccepted licence both arrive as
+    `GatedRepoError: 401` — verified 2026-08-21 against a real revoked token.
+
+    The first version of this message simply said "accept the licence", which
+    would have sent someone to accept a licence they already held while the
+    actual problem was a dead token. So the token is checked directly rather
+    than inferred from the exception text.
+
+    This one bit for real: Sean's server token had been removed from his
+    HuggingFace account, and nothing noticed because the models already in the
+    cache kept working. It would have surfaced as a "licence" error at the exact
+    moment of switching to a new model — the least helpful possible time.
+    """
+
+    def _diagnose(self):
+        from gpu_server.processors.pyannote_processor import (
+            _diagnose_access_failure,
+        )
+        return _diagnose_access_failure
+
+    def test_no_token_says_no_token(self):
+        message = self._diagnose()("", "pyannote/speaker-diarization-community-1")
+        assert "NO HuggingFace token" in message
+        assert "config.yaml" in message
+
+    def test_an_invalid_token_does_not_advise_accepting_a_licence(self, monkeypatch):
+        """The whole point. Advising a licence here wastes the reader's time on
+        the wrong account page while the real cause goes unmentioned."""
+        import gpu_server.processors.pyannote_processor as mod
+
+        class _Api:
+            def whoami(self, token=None):
+                raise RuntimeError("Invalid user token.")
+
+        monkeypatch.setattr("huggingface_hub.HfApi", _Api)
+        message = self._diagnose()("hf_dead", "pyannote/speaker-diarization-community-1")
+
+        assert "NOT VALID" in message
+        assert "will NOT help" in message
+        assert "settings/tokens" in message
+
+    def test_an_invalid_token_warns_that_the_cache_hides_it(self, monkeypatch):
+        """Why it stayed invisible: already-downloaded models keep working, so
+        the failure waits for the next fetch."""
+        import gpu_server.processors.pyannote_processor as mod
+
+        class _Api:
+            def whoami(self, token=None):
+                raise RuntimeError("Invalid user token.")
+
+        monkeypatch.setattr("huggingface_hub.HfApi", _Api)
+        message = self._diagnose()("hf_dead", "m")
+        assert "cache" in message
+
+    def test_a_valid_token_names_the_account_to_accept_on(self, monkeypatch):
+        """Negative control, and the thing that makes the licence advice usable:
+        'accept the licence' is useless without saying on which account."""
+        class _Api:
+            def whoami(self, token=None):
+                return {"name": "sean-server-bot"}
+
+        monkeypatch.setattr("huggingface_hub.HfApi", _Api)
+        message = self._diagnose()("hf_good", "pyannote/speaker-diarization-community-1")
+
+        assert "LICENCE problem" in message
+        assert "sean-server-bot" in message
+        assert "NOT VALID" not in message
