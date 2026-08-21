@@ -136,7 +136,25 @@ async def main():
         logger.info(f"Server ready: ws://{config.server.host}:{config.server.port}")
         logger.info(f"Auth enabled: {config.auth.enabled}")
         logger.info(f"Whisper model: {config.whisper.model}")
+        # Report what was CHECKED, not what was configured. The old line
+        # printed the configured model regardless, which states a setting in
+        # the grammar of a capability -- and a token that was present but
+        # revoked produced no complaint at all, because cached models load with
+        # no network call. This server ran for weeks in exactly that state.
+        from .diarisation_access import check_diarisation_access
+        access = check_diarisation_access(
+            config.pyannote.huggingface_token, config.pyannote.model
+        )
         logger.info(f"PyAnnote model: {config.pyannote.model}")
+        if access.diarisation_available:
+            logger.info(f"  Diarisation: AVAILABLE ({access.detail})")
+        elif access.is_definite_failure:
+            # Loud, because it is definite and someone has to act on it.
+            logger.error(f"  Diarisation: UNAVAILABLE — {access.detail}")
+        else:
+            # Fails OPEN: unreachable is not unavailable, and refusing to start
+            # over a network blip would be a worse failure than the silence.
+            logger.warning(f"  Diarisation: UNVERIFIED — {access.detail}")
         if config.video_encoding.enabled:
             logger.info(f"Video encoding: ENABLED")
             logger.info(f"  FFmpeg: {config.video_encoding.ffmpeg_path}")
