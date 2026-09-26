@@ -5,8 +5,8 @@ asks for ``transcribe=False, diarize=True`` and assigns the returned speaker
 TURNS onto its own existing segments. This server stays dumb about that: it
 does not learn about transcripts. What it must guarantee, and what these pin:
 
-* the turns come back in ``diarization_segments``, with the same ``Person-N``
-  labels the embeddings carry;
+* the turns come back in ``diarization_segments``, passed through unchanged
+  alongside the embeddings;
 * Whisper is not run, loaded or asked for - no wasted GPU time, and no second
   rendering of the audio for anyone to adopt by mistake;
 * the serialised result carries the turns (the client parses the JSON).
@@ -65,7 +65,10 @@ async def test_turns_only_returns_turns_and_never_touches_whisper(worker):
     assert result.transcript_segments == [] and result.full_text == ""
     assert [(t.start, t.end, t.speaker) for t in result.diarization_segments] == \
            [(0.0, 8.5, "Person-1"), (8.5, 12.0, "Person-2")]
-    # The embeddings are keyed by the same labels as the turns.
+    # Passed through as the processor produced them. That the processor keys
+    # turns and embeddings by the SAME Person-N labels is its own job
+    # (pyannote_processor normalises SPEAKER_nn once, before both) and is not
+    # proven here - the fake builds both from one list.
     assert {e.speaker_label for e in result.speaker_embeddings} == {"Person-1", "Person-2"}
     assert result.warnings == []
 
